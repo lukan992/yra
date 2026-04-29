@@ -27,10 +27,28 @@ class LawRetriever:
             .replace("{{FACTS}}", json.dumps(facts, ensure_ascii=False))
         )
         search_query = self.llm_client.complete_json(prompt, self.settings.litellm_main_model)
-        query = str(search_query.get("query") or facts.get("summary") or user_text)
+        query = self._build_query(search_query, facts, user_text)
         tags = search_query.get("tags") if isinstance(search_query.get("tags"), list) else []
         laws = self.law_repository.search(query=query, tags=tags, top_k=top_k)
         if not laws:
             log_json("law_retrieval_error", reason="no_matching_articles", search_query=search_query)
             raise LegalContextNotFoundError()
         return search_query, laws
+
+    @staticmethod
+    def _build_query(search_query: dict[str, Any], facts: dict[str, Any], user_text: str) -> str:
+        if search_query.get("query"):
+            return str(search_query["query"])
+
+        query_parts: list[str] = []
+        if search_query.get("main_query"):
+            query_parts.append(str(search_query["main_query"]))
+
+        alternative_queries = search_query.get("alternative_queries")
+        if isinstance(alternative_queries, list):
+            query_parts.extend(str(query) for query in alternative_queries if query)
+
+        if not query_parts:
+            query_parts.append(str(facts.get("summary") or user_text))
+
+        return " ".join(query_parts)

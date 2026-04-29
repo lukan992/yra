@@ -38,6 +38,7 @@ class ClaimPipeline:
         used_laws: list[dict[str, Any]] = []
         claim_json: dict[str, Any] | None = None
         validation: dict[str, Any] | None = None
+        evaluation: dict[str, Any] = {}
 
         log_json("pipeline_started", request_id=str(request.id), run_id=str(run.id))
 
@@ -77,7 +78,8 @@ class ClaimPipeline:
                 evaluation,
             )
 
-            evaluator_status = evaluation.get("pretrial_claim_status")
+            case_type = self._case_type(facts, evaluation)
+            evaluator_status = evaluation.get("status") or evaluation.get("pretrial_claim_status")
             if evaluator_status == "route_to_lawyer":
                 self.claim_repository.update_run(run, "route_to_lawyer", case_type=case_type)
                 response = self._response(
@@ -117,7 +119,7 @@ class ClaimPipeline:
                 log_json("pipeline_finished", request_id=str(request.id), run_id=str(run.id), status=response.status)
                 return response
 
-            claim_json = self.claim_generator.generate(user_text, facts, used_laws)
+            claim_json = self.claim_generator.generate(user_text, facts, evaluation, used_laws)
             self._step(
                 run.id,
                 "claim_generator",
@@ -127,7 +129,7 @@ class ClaimPipeline:
             )
 
             claim_used_laws = self._extract_used_laws(claim_json, used_laws)
-            validation = self.claim_validator.validate(user_text, facts, used_laws, claim_used_laws, claim_json)
+            validation = self.claim_validator.validate(user_text, facts, evaluation, used_laws, claim_used_laws, claim_json)
             self._step(
                 run.id,
                 "claim_validator",
@@ -135,6 +137,7 @@ class ClaimPipeline:
                 {
                     "user_text": user_text,
                     "facts": facts,
+                    "evaluation": evaluation,
                     "legal_context": used_laws,
                     "used_laws": claim_used_laws,
                     "claim_json": claim_json,
@@ -142,7 +145,7 @@ class ClaimPipeline:
                 validation,
             )
 
-            if not validation.get("is_valid", False) or validation.get("recommendation") in {"regenerate", "error"}:
+            if not validation.get("is_valid", False) or validation.get("recommendation") != "approve":
                 error = ErrorResponse(code="VALIDATION_FAILED", message="Validator found issues in generated claim.")
                 self.claim_repository.update_run(
                     run,
@@ -168,7 +171,7 @@ class ClaimPipeline:
             self.claim_repository.update_run(
                 run,
                 "error",
-                case_type=self._string_or_none(facts.get("preliminary_case_type")),
+                case_type=self._case_type(facts, evaluation),
                 error_code=exc.code,
                 error_message=exc.message,
             )
@@ -181,6 +184,7 @@ class ClaimPipeline:
                 claim_json=claim_json,
                 validation=validation,
                 error=ErrorResponse(code=exc.code, message=exc.message),
+                evaluation=evaluation,
             )
             log_json("pipeline_finished", request_id=str(request.id), run_id=str(run.id), status=response.status, error=exc.code)
             return response
@@ -196,7 +200,7 @@ class ClaimPipeline:
             self.claim_repository.update_run(
                 run,
                 "error",
-                case_type=self._string_or_none(facts.get("preliminary_case_type")),
+                case_type=self._case_type(facts, evaluation),
                 error_code="INTERNAL_ERROR",
                 error_message=message,
             )
@@ -209,6 +213,7 @@ class ClaimPipeline:
                 claim_json=claim_json,
                 validation=validation,
                 error=ErrorResponse(code="INTERNAL_ERROR", message=message),
+                evaluation=evaluation,
             )
             log_json("pipeline_finished", request_id=str(request.id), run_id=str(run.id), status=response.status, error="INTERNAL_ERROR")
             return response
@@ -246,17 +251,20 @@ class ClaimPipeline:
         evaluation: dict[str, Any] | None = None,
     ) -> ClaimAnalyzeResponse:
         facts = facts or {}
-        missing_fields = self._list_or_empty(
-            evaluation.get("missing_required_fields") if evaluation else facts.get("missing_fields")
+        missing_fields = self._combined_list(
+            facts.get("missing_fields"),
+            evaluation.get("missing_required_fields") if evaluation else None,
+            evaluation.get("missing_optional_fields") if evaluation else None,
         )
-        clarifying_questions = self._list_or_empty(
-            evaluation.get("clarifying_questions") if evaluation else facts.get("clarifying_questions")
+        clarifying_questions = self._combined_list(
+            facts.get("clarifying_questions"),
+            evaluation.get("clarifying_questions") if evaluation else None,
         )
         return ClaimAnalyzeResponse(
             status=status,
             request_id=str(request_id),
             run_id=str(run_id),
-            case_type=self._string_or_none(facts.get("preliminary_case_type")),
+            case_type=self._case_type(facts, evaluation),
             summary=self._string_or_none(facts.get("summary") or facts.get("problem_summary")),
             facts=facts,
             missing_fields=missing_fields,
@@ -285,6 +293,18 @@ class ClaimPipeline:
     @staticmethod
     def _list_or_empty(value: Any) -> list[Any]:
         return value if isinstance(value, list) else []
+
+    @classmethod
+    def _combined_list(cls, *values: Any) -> list[Any]:
+        combined: list[Any] = []
+        for value in values:
+            combined.extend(cls._list_or_empty(value))
+        return combined
+
+    @classmethod
+    def _case_type(cls, facts: dict[str, Any], evaluation: dict[str, Any] | None = None) -> str | None:
+        evaluation = evaluation or {}
+        return cls._string_or_none(evaluation.get("case_type")) or cls._string_or_none(facts.get("preliminary_case_type"))
 
     @staticmethod
     def _string_or_none(value: Any) -> str | None:

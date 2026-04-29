@@ -16,6 +16,7 @@ class ClaimValidator:
         self,
         user_text: str,
         facts: dict[str, Any],
+        evaluation: dict[str, Any],
         legal_context: list[dict[str, Any]],
         used_laws: list[dict[str, Any]],
         claim_json: dict[str, Any],
@@ -24,6 +25,7 @@ class ClaimValidator:
         prompt = (
             prompt_template.replace("{{USER_TEXT}}", json.dumps(user_text, ensure_ascii=False))
             .replace("{{FACTS}}", json.dumps(facts, ensure_ascii=False))
+            .replace("{{EVALUATION}}", json.dumps(evaluation, ensure_ascii=False))
             .replace("{{LEGAL_CONTEXT}}", json.dumps(legal_context, ensure_ascii=False))
             .replace("{{USED_LAWS}}", json.dumps(used_laws, ensure_ascii=False))
             .replace("{{CLAIM_JSON}}", json.dumps(claim_json, ensure_ascii=False))
