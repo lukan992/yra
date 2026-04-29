@@ -14,5 +14,6 @@ class FactExtractor:
 
     def extract(self, user_text: str) -> dict[str, Any]:
         prompt_template = self.prompt_loader.load("fact_extractor.md")
-        prompt = prompt_template.replace("{{USER_TEXT}}", json.dumps(user_text, ensure_ascii=False))
+        user_text_json = json.dumps(user_text, ensure_ascii=False)
+        prompt = prompt_template.replace("{{USER_TEXT}}", user_text_json).replace("{{ user_text }}", user_text_json)
         return self.llm_client.complete_json(prompt, self.settings.litellm_main_model)

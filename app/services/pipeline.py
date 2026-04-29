@@ -8,6 +8,7 @@ from app.repositories.claim_repository import ClaimRepository
 from app.repositories.law_repository import LawRepository
 from app.schemas.pipeline import LegalContextNotFoundError, PipelineError
 from app.schemas.responses import ClaimAnalyzeResponse, ErrorResponse
+from app.services.claim_evaluator import ClaimEvaluator
 from app.services.claim_generator import ClaimGenerator
 from app.services.claim_validator import ClaimValidator
 from app.services.fact_extractor import FactExtractor
@@ -25,6 +26,7 @@ class ClaimPipeline:
         self.llm_client = LiteLLMClient()
         self.fact_extractor = FactExtractor(self.llm_client, self.prompt_loader)
         self.law_retriever = LawRetriever(self.law_repository, self.llm_client, self.prompt_loader)
+        self.claim_evaluator = ClaimEvaluator(self.llm_client, self.prompt_loader)
         self.claim_generator = ClaimGenerator(self.llm_client, self.prompt_loader)
         self.claim_validator = ClaimValidator(self.llm_client, self.prompt_loader)
 
@@ -42,14 +44,8 @@ class ClaimPipeline:
         try:
             facts = self.fact_extractor.extract(user_text)
             self._step(run.id, "fact_extractor", "completed", {"user_text": user_text}, facts)
-            case_type = self._string_or_none(facts.get("case_type"))
+            case_type = self._string_or_none(facts.get("preliminary_case_type"))
             self.claim_repository.update_run(run, "facts_extracted", case_type=case_type)
-
-            if facts.get("recommended_status") == "route_to_lawyer":
-                self.claim_repository.update_run(run, "route_to_lawyer", case_type=case_type)
-                response = self._response("route_to_lawyer", request.id, run.id, facts=facts)
-                log_json("pipeline_finished", request_id=str(request.id), run_id=str(run.id), status=response.status)
-                return response
 
             try:
                 search_query, used_laws = self.law_retriever.retrieve(user_text, facts)
@@ -71,6 +67,55 @@ class ClaimPipeline:
                 {"search_query": search_query, "used_laws": used_laws},
             )
             self.claim_repository.update_run(run, "legal_context_found", case_type=case_type)
+
+            evaluation = self.claim_evaluator.evaluate(user_text, facts, used_laws)
+            self._step(
+                run.id,
+                "claim_evaluator",
+                "completed",
+                {"user_text": user_text, "facts": facts, "legal_context": used_laws},
+                evaluation,
+            )
+
+            evaluator_status = evaluation.get("pretrial_claim_status")
+            if evaluator_status == "route_to_lawyer":
+                self.claim_repository.update_run(run, "route_to_lawyer", case_type=case_type)
+                response = self._response(
+                    "route_to_lawyer",
+                    request.id,
+                    run.id,
+                    facts=facts,
+                    used_laws=used_laws,
+                    evaluation=evaluation,
+                )
+                log_json("pipeline_finished", request_id=str(request.id), run_id=str(run.id), status=response.status)
+                return response
+
+            if evaluator_status == "need_more_info":
+                self.claim_repository.update_run(run, "need_more_info", case_type=case_type)
+                response = self._response(
+                    "need_more_info",
+                    request.id,
+                    run.id,
+                    facts=facts,
+                    used_laws=used_laws,
+                    evaluation=evaluation,
+                )
+                log_json("pipeline_finished", request_id=str(request.id), run_id=str(run.id), status=response.status)
+                return response
+
+            if evaluator_status != "applicable":
+                error = ErrorResponse(code="CLAIM_EVALUATION_FAILED", message="Claim evaluator did not approve generation.")
+                self.claim_repository.update_run(
+                    run,
+                    "error",
+                    case_type=case_type,
+                    error_code=error.code,
+                    error_message=error.message,
+                )
+                response = self._response("error", request.id, run.id, facts=facts, used_laws=used_laws, evaluation=evaluation, error=error)
+                log_json("pipeline_finished", request_id=str(request.id), run_id=str(run.id), status=response.status)
+                return response
 
             claim_json = self.claim_generator.generate(user_text, facts, used_laws)
             self._step(
@@ -111,10 +156,9 @@ class ClaimPipeline:
                 log_json("pipeline_finished", request_id=str(request.id), run_id=str(run.id), status=response.status)
                 return response
 
-            final_status = self._final_status(facts)
-            self.claim_repository.update_run(run, final_status, case_type=case_type)
-            self.claim_repository.create_generated_claim(request.id, run.id, final_status, claim_json, validation, claim_used_laws)
-            response = self._response(final_status, request.id, run.id, facts, claim_used_laws, claim_json, validation)
+            self.claim_repository.update_run(run, "claim_generated", case_type=case_type)
+            self.claim_repository.create_generated_claim(request.id, run.id, "claim_generated", claim_json, validation, claim_used_laws)
+            response = self._response("claim_generated", request.id, run.id, facts, claim_used_laws, claim_json, validation)
             log_json("pipeline_finished", request_id=str(request.id), run_id=str(run.id), status=response.status)
             return response
 
@@ -124,7 +168,7 @@ class ClaimPipeline:
             self.claim_repository.update_run(
                 run,
                 "error",
-                case_type=self._string_or_none(facts.get("case_type")),
+                case_type=self._string_or_none(facts.get("preliminary_case_type")),
                 error_code=exc.code,
                 error_message=exc.message,
             )
@@ -152,7 +196,7 @@ class ClaimPipeline:
             self.claim_repository.update_run(
                 run,
                 "error",
-                case_type=self._string_or_none(facts.get("case_type")),
+                case_type=self._string_or_none(facts.get("preliminary_case_type")),
                 error_code="INTERNAL_ERROR",
                 error_message=message,
             )
@@ -199,32 +243,29 @@ class ClaimPipeline:
         claim_json: dict[str, Any] | None = None,
         validation: dict[str, Any] | None = None,
         error: ErrorResponse | None = None,
+        evaluation: dict[str, Any] | None = None,
     ) -> ClaimAnalyzeResponse:
         facts = facts or {}
+        missing_fields = self._list_or_empty(
+            evaluation.get("missing_required_fields") if evaluation else facts.get("missing_fields")
+        )
+        clarifying_questions = self._list_or_empty(
+            evaluation.get("clarifying_questions") if evaluation else facts.get("clarifying_questions")
+        )
         return ClaimAnalyzeResponse(
             status=status,
             request_id=str(request_id),
             run_id=str(run_id),
-            case_type=self._string_or_none(facts.get("case_type")),
+            case_type=self._string_or_none(facts.get("preliminary_case_type")),
             summary=self._string_or_none(facts.get("summary") or facts.get("problem_summary")),
             facts=facts,
-            missing_fields=self._list_or_empty(facts.get("missing_fields")),
-            clarifying_questions=self._list_or_empty(facts.get("clarifying_questions")),
+            missing_fields=missing_fields,
+            clarifying_questions=clarifying_questions,
             used_laws=used_laws or [],
             claim_json=claim_json,
             validation=validation,
             error=error,
         )
-
-    @staticmethod
-    def _final_status(facts: dict[str, Any]) -> str:
-        recommended_status = facts.get("recommended_status")
-        if recommended_status in {"need_more_info", "route_to_lawyer"}:
-            return recommended_status
-        missing_fields = facts.get("missing_fields")
-        if isinstance(missing_fields, list) and missing_fields:
-            return "need_more_info"
-        return "claim_generated"
 
     @staticmethod
     def _extract_used_laws(claim_json: dict[str, Any], legal_context: list[dict[str, Any]]) -> list[dict[str, Any]]:

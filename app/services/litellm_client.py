@@ -37,13 +37,24 @@ class LiteLLMClient:
                 parsed = self._parse_json(content)
                 log_json("litellm_response", model=model, attempt=attempt, raw_response=content, parsed_response=parsed)
                 return parsed
-            except LLMError:
-                raise
+            except LLMError as exc:
+                last_error = exc
+                logger.warning("LiteLLM JSON handling failed")
+                log_json(
+                    "litellm_error",
+                    model=model,
+                    attempt=attempt,
+                    error_code=exc.code,
+                    error=exc.message,
+                    details=exc.details,
+                )
             except Exception as exc:
                 last_error = exc
                 logger.exception("LiteLLM call failed")
                 log_json("litellm_error", model=model, attempt=attempt, error=str(exc))
 
+        if isinstance(last_error, LLMError):
+            raise last_error
         raise LLMError("LITELLM_ERROR", "LiteLLM request failed.", {"error": str(last_error)})
 
     def _parse_json(self, content: str) -> dict[str, Any]:
