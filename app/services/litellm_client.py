@@ -19,14 +19,15 @@ class LiteLLMClient:
 
         last_error: Exception | None = None
         attempts = max(self.settings.litellm_max_retries, 0) + 1
+        litellm_model = self._resolve_model(model)
 
         for attempt in range(1, attempts + 1):
             try:
                 from litellm import completion
 
-                log_json("litellm_request", model=model, attempt=attempt, prompt=prompt)
+                log_json("litellm_request", model=model, litellm_model=litellm_model, attempt=attempt, prompt=prompt)
                 response = completion(
-                    model=model,
+                    model=litellm_model,
                     messages=[{"role": "user", "content": prompt}],
                     api_base=self.settings.litellm_base_url or None,
                     api_key=self.settings.litellm_api_key or None,
@@ -35,7 +36,14 @@ class LiteLLMClient:
                 )
                 content = response.choices[0].message.content or ""
                 parsed = self._parse_json(content)
-                log_json("litellm_response", model=model, attempt=attempt, raw_response=content, parsed_response=parsed)
+                log_json(
+                    "litellm_response",
+                    model=model,
+                    litellm_model=litellm_model,
+                    attempt=attempt,
+                    raw_response=content,
+                    parsed_response=parsed,
+                )
                 return parsed
             except LLMError as exc:
                 last_error = exc
@@ -43,6 +51,7 @@ class LiteLLMClient:
                 log_json(
                     "litellm_error",
                     model=model,
+                    litellm_model=litellm_model,
                     attempt=attempt,
                     error_code=exc.code,
                     error=exc.message,
@@ -51,11 +60,18 @@ class LiteLLMClient:
             except Exception as exc:
                 last_error = exc
                 logger.exception("LiteLLM call failed")
-                log_json("litellm_error", model=model, attempt=attempt, error=str(exc))
+                log_json("litellm_error", model=model, litellm_model=litellm_model, attempt=attempt, error=str(exc))
 
         if isinstance(last_error, LLMError):
             raise last_error
         raise LLMError("LITELLM_ERROR", "LiteLLM request failed.", {"error": str(last_error)})
+
+    def _resolve_model(self, model: str) -> str:
+        if "/" in model:
+            return model
+        if self.settings.litellm_base_url:
+            return f"openai/{model}"
+        return model
 
     def _parse_json(self, content: str) -> dict[str, Any]:
         cleaned = content.strip()
