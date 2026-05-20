@@ -19,7 +19,7 @@ class LawRetriever:
     def retrieve(self, user_text: str, facts: dict[str, Any], top_k: int = 5) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         if not self.law_repository.has_active_articles():
             log_json("law_retrieval_error", reason="law_articles_empty")
-            raise LegalContextNotFoundError()
+            raise LegalContextNotFoundError("Таблица law_articles пуста. Сначала загрузите нормы права в БД.")
 
         prompt_template = self.prompt_loader.load("law_query_builder.md")
         prompt = (
@@ -32,7 +32,10 @@ class LawRetriever:
         laws = self.law_repository.search(query=query, tags=tags, top_k=top_k)
         if not laws:
             log_json("law_retrieval_error", reason="no_matching_articles", search_query=search_query)
-            raise LegalContextNotFoundError()
+            raise LegalContextNotFoundError(
+                "В БД есть активные нормы, но поиск не нашел релевантных статей для этого запроса.",
+                {"search_query": search_query, "normalized_query": query, "tags": tags},
+            )
         return search_query, laws
 
     @staticmethod

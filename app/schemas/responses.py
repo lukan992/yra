@@ -3,7 +3,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-PipelineStatus = Literal["claim_generated", "need_more_info", "route_to_lawyer", "error"]
+PipelineStatus = Literal["claim_generated", "need_more_info", "route_to_lawyer", "legal_guidance", "error"]
 
 
 class ErrorResponse(BaseModel):
@@ -21,6 +21,7 @@ class ClaimAnalyzeResponse(BaseModel):
     missing_fields: list[Any] = Field(default_factory=list)
     clarifying_questions: list[Any] = Field(default_factory=list)
     used_laws: list[Any] = Field(default_factory=list)
+    guidance: dict[str, Any] | None = None
     claim_json: dict[str, Any] | None = None
     validation: dict[str, Any] | None = None
     error: ErrorResponse | None = None

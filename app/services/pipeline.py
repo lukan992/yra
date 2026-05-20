@@ -12,6 +12,7 @@ from app.services.claim_evaluator import ClaimEvaluator
 from app.services.claim_generator import ClaimGenerator
 from app.services.claim_validator import ClaimValidator
 from app.services.fact_extractor import FactExtractor
+from app.services.legal_guidance_generator import LegalGuidanceGenerator
 from app.services.law_retriever import LawRetriever
 from app.services.litellm_client import LiteLLMClient
 from app.services.prompt_loader import PromptLoader
@@ -29,6 +30,7 @@ class ClaimPipeline:
         self.claim_evaluator = ClaimEvaluator(self.llm_client, self.prompt_loader)
         self.claim_generator = ClaimGenerator(self.llm_client, self.prompt_loader)
         self.claim_validator = ClaimValidator(self.llm_client, self.prompt_loader)
+        self.legal_guidance_generator = LegalGuidanceGenerator(self.llm_client, self.prompt_loader)
 
     def run(self, user_text: str) -> ClaimAnalyzeResponse:
         request = self.claim_repository.create_request(user_text)
@@ -39,6 +41,7 @@ class ClaimPipeline:
         claim_json: dict[str, Any] | None = None
         validation: dict[str, Any] | None = None
         evaluation: dict[str, Any] = {}
+        guidance: dict[str, Any] | None = None
 
         log_json("pipeline_started", request_id=str(request.id), run_id=str(run.id))
 
@@ -68,6 +71,27 @@ class ClaimPipeline:
                 {"search_query": search_query, "used_laws": used_laws},
             )
             self.claim_repository.update_run(run, "legal_context_found", case_type=case_type)
+
+            if self._should_generate_guidance(facts, used_laws):
+                guidance = self.legal_guidance_generator.generate(user_text, facts, used_laws)
+                self._step(
+                    run.id,
+                    "legal_guidance_generator",
+                    "completed",
+                    {"user_text": user_text, "facts": facts, "legal_context": used_laws},
+                    guidance,
+                )
+                self.claim_repository.update_run(run, "legal_guidance", case_type=self._case_type(facts))
+                response = self._response(
+                    "legal_guidance",
+                    request.id,
+                    run.id,
+                    facts=facts,
+                    used_laws=used_laws,
+                    guidance=guidance,
+                )
+                log_json("pipeline_finished", request_id=str(request.id), run_id=str(run.id), status=response.status)
+                return response
 
             evaluation = self.claim_evaluator.evaluate(user_text, facts, used_laws)
             self._step(
@@ -185,6 +209,7 @@ class ClaimPipeline:
                 validation=validation,
                 error=ErrorResponse(code=exc.code, message=exc.message),
                 evaluation=evaluation,
+                guidance=guidance,
             )
             log_json("pipeline_finished", request_id=str(request.id), run_id=str(run.id), status=response.status, error=exc.code)
             return response
@@ -214,6 +239,7 @@ class ClaimPipeline:
                 validation=validation,
                 error=ErrorResponse(code="INTERNAL_ERROR", message=message),
                 evaluation=evaluation,
+                guidance=guidance,
             )
             log_json("pipeline_finished", request_id=str(request.id), run_id=str(run.id), status=response.status, error="INTERNAL_ERROR")
             return response
@@ -249,27 +275,33 @@ class ClaimPipeline:
         validation: dict[str, Any] | None = None,
         error: ErrorResponse | None = None,
         evaluation: dict[str, Any] | None = None,
+        guidance: dict[str, Any] | None = None,
     ) -> ClaimAnalyzeResponse:
         facts = facts or {}
         missing_fields = self._combined_list(
             facts.get("missing_fields"),
             evaluation.get("missing_required_fields") if evaluation else None,
+            guidance.get("missing_fields") if guidance else None,
             evaluation.get("missing_optional_fields") if evaluation else None,
         )
         clarifying_questions = self._combined_list(
             facts.get("clarifying_questions"),
             evaluation.get("clarifying_questions") if evaluation else None,
+            guidance.get("clarifying_questions") if guidance else None,
         )
         return ClaimAnalyzeResponse(
             status=status,
             request_id=str(request_id),
             run_id=str(run_id),
-            case_type=self._case_type(facts, evaluation),
-            summary=self._string_or_none(facts.get("summary") or facts.get("problem_summary")),
+            case_type=self._case_type(facts, evaluation, guidance),
+            summary=self._string_or_none(
+                (guidance.get("summary") if guidance else None) or facts.get("summary") or facts.get("problem_summary")
+            ),
             facts=facts,
             missing_fields=missing_fields,
             clarifying_questions=clarifying_questions,
             used_laws=used_laws or [],
+            guidance=guidance,
             claim_json=claim_json,
             validation=validation,
             error=error,
@@ -302,9 +334,42 @@ class ClaimPipeline:
         return combined
 
     @classmethod
-    def _case_type(cls, facts: dict[str, Any], evaluation: dict[str, Any] | None = None) -> str | None:
+    def _case_type(
+        cls,
+        facts: dict[str, Any],
+        evaluation: dict[str, Any] | None = None,
+        guidance: dict[str, Any] | None = None,
+    ) -> str | None:
         evaluation = evaluation or {}
-        return cls._string_or_none(evaluation.get("case_type")) or cls._string_or_none(facts.get("preliminary_case_type"))
+        guidance = guidance or {}
+        return (
+            cls._string_or_none(evaluation.get("case_type"))
+            or cls._string_or_none(guidance.get("case_type"))
+            or cls._string_or_none(facts.get("preliminary_case_type"))
+        )
+
+    @classmethod
+    def _should_generate_guidance(cls, facts: dict[str, Any], legal_context: list[dict[str, Any]]) -> bool:
+        case_type = cls._string_or_none(facts.get("preliminary_case_type"))
+        if case_type in {
+            "defective_goods",
+            "defective_service",
+            "delivery_delay",
+            "service_delay",
+            "refund_request",
+            "warranty_repair",
+            "price_or_payment_dispute",
+            "marketplace_dispute",
+            "technical_complex_goods",
+        }:
+            return False
+
+        law_names = {
+            law_name.casefold()
+            for law in legal_context
+            if isinstance((law_name := law.get("law_name")), str)
+        }
+        return any("трудов" in law_name or "уголов" in law_name for law_name in law_names)
 
     @staticmethod
     def _string_or_none(value: Any) -> str | None:

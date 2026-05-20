@@ -22,9 +22,10 @@ USER_TEXT:
 3. Не превращай относительные даты в точные календарные даты.
 4. Не придумывай ФИО, адреса, цену, дату покупки, название продавца.
 5. Если текст эмоциональный, выдели юридически значимые факты нейтрально.
-6. Если ситуация не похожа на потребительский спор, всё равно извлеки факты и поставь preliminary_case_type = "outside_zopp_scope".
-7. Верни только валидный JSON.
-8. Не добавляй markdown, комментарии или пояснения вне JSON.
+6. Если ситуация относится к трудовым правам работника, поставь preliminary_case_type = "labor_rights".
+7. Если ситуация не похожа на потребительский спор и не относится к трудовым правам, всё равно извлеки факты и поставь preliminary_case_type = "outside_zopp_scope".
+8. Верни только валидный JSON.
+9. Не добавляй markdown, комментарии или пояснения вне JSON.
 
 # Важное правило про даты
 
@@ -53,6 +54,7 @@ USER_TEXT:
 - price_or_payment_dispute
 - marketplace_dispute
 - technical_complex_goods
+- labor_rights
 - outside_zopp_scope
 - unknown
 
@@ -62,6 +64,7 @@ USER_TEXT:
 - buyer
 - customer
 - client
+- employee
 - unknown
 
 # Допустимые значения opponent_role
@@ -80,16 +83,16 @@ USER_TEXT:
 
 {
   "summary": "Краткое нейтральное описание ситуации в 1-3 предложениях",
-  "preliminary_case_type": "defective_goods | defective_service | delivery_delay | service_delay | refund_request | warranty_repair | price_or_payment_dispute | marketplace_dispute | technical_complex_goods | outside_zopp_scope | unknown",
+  "preliminary_case_type": "defective_goods | defective_service | delivery_delay | service_delay | refund_request | warranty_repair | price_or_payment_dispute | marketplace_dispute | technical_complex_goods | labor_rights | outside_zopp_scope | unknown",
   "confidence": "high | medium | low",
   "parties": {
-    "applicant_role": "consumer | buyer | customer | client | unknown",
+    "applicant_role": "consumer | buyer | customer | client | employee | unknown",
     "applicant_name": null,
     "opponent_role": "seller | service_provider | manufacturer | marketplace | delivery_service | private_person | government_body | employer | unknown",
     "opponent_name": null
   },
   "transaction": {
-    "type": "purchase | service | delivery | repair | unknown",
+    "type": "purchase | service | delivery | repair | employment | unknown",
     "item_or_service": null,
     "price": null,
     "currency": "RUB | unknown",
@@ -98,10 +101,10 @@ USER_TEXT:
       "relative_date": null,
       "raw_text": null
     },
-    "purpose": "personal | business | unknown"
+    "purpose": "personal | business | work | unknown"
   },
   "problem": {
-    "problem_type": "defect | delay | refusal | bad_quality | non_delivery | incorrect_price | other | unknown",
+    "problem_type": "defect | delay | refusal | bad_quality | non_delivery | incorrect_price | salary_delay | forced_work | dismissal_threat | discrimination | other | unknown",
     "description": null,
     "problem_date": {
       "exact_date": null,

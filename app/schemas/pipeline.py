@@ -10,10 +10,11 @@ class PipelineError(Exception):
 
 
 class LegalContextNotFoundError(PipelineError):
-    def __init__(self) -> None:
+    def __init__(self, message: str | None = None, details: dict[str, Any] | None = None) -> None:
         super().__init__(
             code="LEGAL_CONTEXT_NOT_FOUND",
-            message="Не найдены релевантные нормы права в БД. Заполните таблицу law_articles.",
+            message=message or "Не найдены релевантные нормы права в БД.",
+            details=details,
         )
 
 
