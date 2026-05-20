@@ -40,6 +40,12 @@ docker compose up --build
 docker compose exec backend python -m app.db.init_db
 ```
 
+Или одной командой создайте таблицы и сразу загрузите законы:
+
+```bash
+docker compose exec backend python scripts/bootstrap_db.py --with-laws
+```
+
 FastAPI docs будут доступны по адресу `http://localhost:8000/docs`, если `APP_PORT=8000`.
 
 ## API
@@ -119,4 +125,10 @@ uv run python -m compileall app
 
 ```bash
 uv run python -m app.db.init_db
+```
+
+Один запуск для таблиц и законов:
+
+```bash
+uv run python scripts/bootstrap_db.py --with-laws
 ```
