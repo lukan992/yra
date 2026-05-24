@@ -18,12 +18,14 @@ class ClaimGenerator:
         facts: dict[str, Any],
         evaluation: dict[str, Any],
         legal_context: list[dict[str, Any]],
+        legal_area: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         prompt_template = self.prompt_loader.load("claim_generator.md")
         prompt = (
             prompt_template.replace("{{USER_TEXT}}", json.dumps(user_text, ensure_ascii=False))
             .replace("{{FACTS}}", json.dumps(facts, ensure_ascii=False))
             .replace("{{EVALUATION}}", json.dumps(evaluation, ensure_ascii=False))
+            .replace("{{LEGAL_AREA}}", json.dumps(legal_area or {}, ensure_ascii=False))
             .replace("{{LEGAL_CONTEXT}}", json.dumps(legal_context, ensure_ascii=False))
         )
         return self.llm_client.complete_json(prompt, self.settings.litellm_main_model)

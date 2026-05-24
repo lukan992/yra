@@ -1,5 +1,6 @@
 import json
 import re
+import time
 from typing import Any
 
 from loguru import logger
@@ -25,24 +26,38 @@ class LiteLLMClient:
             try:
                 from litellm import completion
 
-                log_json("litellm_request", model=model, litellm_model=litellm_model, attempt=attempt, prompt=prompt)
+                started_at = time.perf_counter()
+                request_payload = {
+                    "model": model,
+                    "litellm_model": litellm_model,
+                    "attempt": attempt,
+                    "prompt_length": len(prompt),
+                    "temperature": self.settings.litellm_temperature,
+                }
+                if self.settings.log_prompts:
+                    request_payload["prompt"] = prompt
+                log_json("litellm_request", **request_payload)
                 response = completion(
                     model=litellm_model,
                     messages=[{"role": "user", "content": prompt}],
                     api_base=self.settings.litellm_base_url or None,
                     api_key=self.settings.litellm_api_key or None,
                     timeout=self.settings.litellm_timeout_seconds,
+                    temperature=self.settings.litellm_temperature,
                     response_format={"type": "json_object"},
                 )
                 content = response.choices[0].message.content or ""
                 parsed = self._parse_json(content)
+                duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
                 log_json(
                     "litellm_response",
                     model=model,
                     litellm_model=litellm_model,
                     attempt=attempt,
-                    raw_response=content,
-                    parsed_response=parsed,
+                    temperature=self.settings.litellm_temperature,
+                    duration_ms=duration_ms,
+                    raw_response=content if self.settings.log_prompts else None,
+                    parsed_response=parsed if self.settings.log_prompts else None,
                 )
                 return parsed
             except LLMError as exc:
@@ -53,6 +68,8 @@ class LiteLLMClient:
                     model=model,
                     litellm_model=litellm_model,
                     attempt=attempt,
+                    temperature=self.settings.litellm_temperature,
+                    duration_ms=round((time.perf_counter() - started_at) * 1000, 2),
                     error_code=exc.code,
                     error=exc.message,
                     details=exc.details,
@@ -60,11 +77,37 @@ class LiteLLMClient:
             except Exception as exc:
                 last_error = exc
                 logger.exception("LiteLLM call failed")
-                log_json("litellm_error", model=model, litellm_model=litellm_model, attempt=attempt, error=str(exc))
+                log_json(
+                    "litellm_error",
+                    model=model,
+                    litellm_model=litellm_model,
+                    attempt=attempt,
+                    temperature=self.settings.litellm_temperature,
+                    duration_ms=round((time.perf_counter() - started_at) * 1000, 2),
+                    error=str(exc),
+                )
 
         if isinstance(last_error, LLMError):
             raise last_error
         raise LLMError("LITELLM_ERROR", "LiteLLM request failed.", {"error": str(last_error)})
+
+    def embed(self, text: str, model: str) -> dict[str, Any]:
+        litellm_model = self._resolve_model(model)
+        try:
+            from litellm import embedding
+
+            response = embedding(
+                model=litellm_model,
+                input=[text],
+                api_base=self.settings.litellm_base_url or None,
+                api_key=self.settings.litellm_api_key or None,
+                timeout=self.settings.litellm_timeout_seconds,
+            )
+            item = response.data[0]
+            return {"embedding": item["embedding"] if isinstance(item, dict) else item.embedding}
+        except Exception as exc:
+            log_json("litellm_embedding_error", model=model, litellm_model=litellm_model, error=str(exc))
+            raise LLMError("LITELLM_EMBEDDING_ERROR", "LiteLLM embedding request failed.", {"error": str(exc)}) from exc
 
     def _resolve_model(self, model: str) -> str:
         if "/" in model:

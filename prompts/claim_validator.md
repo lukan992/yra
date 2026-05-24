@@ -46,10 +46,10 @@ CLAIM_JSON:
    Если сумма не указана пользователем, она должна быть null или плейсхолдером.
 
 5. Нет ли выдуманных сторон.
-   Если ФИО, адрес или название продавца не указаны, они должны быть null или плейсхолдерами.
+   Если ФИО, адрес или название продавца/исполнителя не указаны, они должны быть null или плейсхолдерами.
 
 6. Не расширены ли требования пользователя.
-   Например, нельзя добавлять моральный вред, штраф, неустойку или судебные расходы, если пользователь явно не просил это в MVP.
+   Нельзя добавлять моральный вред, штраф, неустойку, судебные расходы или иные требования, если пользователь явно не просил это и это не разрешено EVALUATION_JSON.
 
 7. Соответствует ли тип претензии фактам пользователя.
 
@@ -59,6 +59,11 @@ CLAIM_JSON:
 9. Не используется ли правовое основание вне LEGAL_CONTEXT.
 
 10. Достаточно ли JSON структурирован для последующего экспорта.
+
+11. Не обосновано ли требование неподходящей статьей.
+   Если CLAIM_JSON связывает требование с нормой, которая по LEGAL_CONTEXT/EVALUATION_JSON покрывает другое требование, это issue типа `unsupported_demand` или `wrong_legal_basis`.
+
+12. Если EVALUATION_JSON содержит claim_coverage, CLAIM_JSON не должен представлять missing/partial claim как полностью покрытый.
 
 # Жесткие правила
 
@@ -71,10 +76,11 @@ CLAIM_JSON:
 7. Если CLAIM_JSON ссылается на норму, которой нет в LEGAL_CONTEXT — is_valid = false.
 8. Если CLAIM_JSON добавляет требования, которых пользователь не заявлял — is_valid = false.
 9. Если CLAIM_JSON.status = "claim_generated", но EVALUATION_JSON.status != "applicable" — is_valid = false.
-10. Если is_valid = false, recommendation должен быть "regenerate" или "error".
-11. Если is_valid = true, массивы hallucinated_laws, invented_facts, invented_dates, invented_amounts, invented_parties и unsupported_demands должны быть пустыми.
-12. Верни только валидный JSON.
-13. Не добавляй markdown, комментарии или пояснения вне JSON.
+10. Если claim coverage отсутствует для основного требования, а CLAIM_JSON представляет требование как полностью обоснованное — is_valid = false.
+11. Если is_valid = false, recommendation должен быть "regenerate" или "error".
+12. Если is_valid = true, массивы hallucinated_laws, invented_facts, invented_dates, invented_amounts, invented_parties и unsupported_demands должны быть пустыми.
+13. Верни только валидный JSON.
+14. Не добавляй markdown, комментарии или пояснения вне JSON.
 
 # Допустимые recommendation
 
@@ -91,7 +97,7 @@ CLAIM_JSON:
   "issues": [
     {
       "severity": "critical | major | minor",
-      "type": "hallucinated_law | invented_fact | invented_date | invented_amount | invented_party | unsupported_demand | wrong_case_type | structure_error | other",
+      "type": "hallucinated_law | invented_fact | invented_date | invented_amount | invented_party | unsupported_demand | wrong_case_type | wrong_legal_basis | structure_error | other",
       "description": "Описание проблемы",
       "evidence": "Фрагмент CLAIM_JSON, где найдена проблема"
     }
@@ -131,6 +137,13 @@ CLAIM_JSON:
     {
       "demand": "Неподтвержденное требование",
       "reason": "Почему требование нельзя добавлять"
+    }
+  ],
+  "wrong_legal_basis": [
+    {
+      "demand": "Требование",
+      "article_number": "Номер статьи",
+      "reason": "Почему статья не покрывает это требование"
     }
   ],
   "structure_errors": [

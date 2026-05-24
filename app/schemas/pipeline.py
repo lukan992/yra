@@ -20,3 +20,7 @@ class LegalContextNotFoundError(PipelineError):
 
 class LLMError(PipelineError):
     pass
+
+
+class EmbeddingUnavailableError(PipelineError):
+    pass

@@ -27,8 +27,24 @@ class Settings(BaseSettings):
     litellm_api_key: str = Field(default="", alias="LITELLM_API_KEY")
     litellm_main_model: str = Field(default="", alias="LITELLM_MAIN_MODEL")
     litellm_validator_model: str = Field(default="", alias="LITELLM_VALIDATOR_MODEL")
+    litellm_embedding_model: str = Field(default="", alias="LITELLM_EMBEDDING_MODEL")
+    litellm_temperature: float = Field(default=0.0, alias="LITELLM_TEMPERATURE")
     litellm_timeout_seconds: int = Field(default=120, alias="LITELLM_TIMEOUT_SECONDS")
     litellm_max_retries: int = Field(default=2, alias="LITELLM_MAX_RETRIES")
+
+    embedding_provider: str = Field(default="ollama", alias="EMBEDDING_PROVIDER")
+    ollama_base_url: str = Field(default="http://localhost:11434", alias="OLLAMA_BASE_URL")
+    embedding_model: str = Field(default="qwen3-embedding:8b", alias="EMBEDDING_MODEL")
+    embedding_dim: int = Field(default=4096, alias="EMBEDDING_DIM")
+    embedding_timeout_seconds: int = Field(default=120, alias="EMBEDDING_TIMEOUT_SECONDS")
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    log_json: bool = Field(default=True, alias="LOG_JSON")
+    log_file: str = Field(default="logs/yra.log", alias="LOG_FILE")
+    log_rotation: str = Field(default="10 MB", alias="LOG_ROTATION")
+    log_retention: str = Field(default="10 days", alias="LOG_RETENTION")
+    log_prompts: bool = Field(default=False, alias="LOG_PROMPTS")
+    log_rag_trace: bool = Field(default=False, alias="LOG_RAG_TRACE")
+    log_rag_trace_full: bool = Field(default=False, alias="LOG_RAG_TRACE_FULL")
 
     @field_validator("app_env", mode="before")
     @classmethod
@@ -82,10 +98,60 @@ class Settings(BaseSettings):
     def blank_litellm_timeout_uses_default(cls, value: Any) -> Any:
         return 120 if value == "" else value
 
+    @field_validator("litellm_temperature", mode="before")
+    @classmethod
+    def blank_litellm_temperature_uses_default(cls, value: Any) -> Any:
+        return 0.0 if value == "" else value
+
     @field_validator("litellm_max_retries", mode="before")
     @classmethod
     def blank_litellm_retries_uses_default(cls, value: Any) -> Any:
         return 2 if value == "" else value
+
+    @field_validator("embedding_provider", mode="before")
+    @classmethod
+    def blank_embedding_provider_uses_default(cls, value: Any) -> Any:
+        return "ollama" if value == "" else value
+
+    @field_validator("ollama_base_url", mode="before")
+    @classmethod
+    def blank_ollama_base_url_uses_default(cls, value: Any) -> Any:
+        return "http://localhost:11434" if value == "" else value
+
+    @field_validator("embedding_model", mode="before")
+    @classmethod
+    def blank_embedding_model_uses_default(cls, value: Any) -> Any:
+        return "qwen3-embedding:8b" if value == "" else value
+
+    @field_validator("embedding_dim", mode="before")
+    @classmethod
+    def blank_embedding_dim_uses_default(cls, value: Any) -> Any:
+        return 4096 if value == "" else value
+
+    @field_validator("embedding_timeout_seconds", mode="before")
+    @classmethod
+    def blank_embedding_timeout_uses_default(cls, value: Any) -> Any:
+        return 120 if value == "" else value
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def blank_log_level_uses_default(cls, value: Any) -> Any:
+        return "INFO" if value == "" else value
+
+    @field_validator("log_file", mode="before")
+    @classmethod
+    def blank_log_file_uses_default(cls, value: Any) -> Any:
+        return "logs/yra.log" if value == "" else value
+
+    @field_validator("log_rotation", mode="before")
+    @classmethod
+    def blank_log_rotation_uses_default(cls, value: Any) -> Any:
+        return "10 MB" if value == "" else value
+
+    @field_validator("log_retention", mode="before")
+    @classmethod
+    def blank_log_retention_uses_default(cls, value: Any) -> Any:
+        return "10 days" if value == "" else value
 
 
 @lru_cache

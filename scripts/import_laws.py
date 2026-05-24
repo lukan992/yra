@@ -39,7 +39,7 @@ LAW_NAME_ALIASES = {
 
 @dataclass
 class ParsedLawArticle:
-    law_name: str
+    act_name: str
     article_number: str
     article_title: str
     article_text: str
@@ -75,7 +75,7 @@ def main() -> None:
     if args.dry_run:
         for article in parsed_articles:
             print(
-                f"{article.law_name} | статья {article.article_number} | "
+                f"{article.act_name} | статья {article.article_number} | "
                 f"{article.article_title} | tags={article.tags}"
             )
         print(f"Parsed {len(parsed_articles)} files from {source_dir}")
@@ -113,16 +113,16 @@ def parse_law_file(path: Path) -> ParsedLawArticle:
     if not non_empty_lines:
         raise ValueError(f"{path} is empty")
 
-    law_name = extract_law_name(path)
+    act_name = extract_law_name(path)
     article_index, article_number, article_title = extract_article_header(non_empty_lines, path)
     article_text = "\n".join(non_empty_lines[article_index + 1 :]).strip()
     if not article_text:
         raise ValueError(f"Could not extract article text from {path}")
 
-    tags = build_tags(non_empty_lines[:article_index], article_title, law_name)
+    tags = build_tags(non_empty_lines[:article_index], article_title, act_name)
 
     return ParsedLawArticle(
-        law_name=law_name,
+        act_name=act_name,
         article_number=article_number,
         article_title=article_title,
         article_text=article_text,
@@ -183,7 +183,7 @@ def upsert_articles(db: Session, parsed_articles: list[ParsedLawArticle]) -> tup
     for parsed in parsed_articles:
         existing = (
             db.query(LawArticle)
-            .filter(LawArticle.law_name == parsed.law_name)
+            .filter(LawArticle.act_name == parsed.act_name)
             .filter(LawArticle.article_number == parsed.article_number)
             .one_or_none()
         )
@@ -191,7 +191,12 @@ def upsert_articles(db: Session, parsed_articles: list[ParsedLawArticle]) -> tup
         if existing is None:
             db.add(
                 LawArticle(
-                    law_name=parsed.law_name,
+                    act_name=parsed.act_name,
+                    act_type="code",
+                    source_file="legacy_txt_import",
+                    article_status="active",
+                    content_hash=None,
+                    search_vector=" ".join([parsed.act_name, parsed.article_title, parsed.article_text]),
                     article_number=parsed.article_number,
                     article_title=parsed.article_title,
                     article_text=parsed.article_text,
@@ -205,6 +210,7 @@ def upsert_articles(db: Session, parsed_articles: list[ParsedLawArticle]) -> tup
         existing.article_title = parsed.article_title
         existing.article_text = parsed.article_text
         existing.tags = parsed.tags
+        existing.search_vector = " ".join([parsed.act_name, parsed.article_title, parsed.article_text])
         existing.is_active = True
         updated += 1
 
