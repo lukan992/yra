@@ -2,7 +2,7 @@ from app.services.legal_area_classifier import LegalAreaClassifier
 
 
 class StubLLM:
-    def complete_json(self, prompt: str, model: str) -> dict:
+    def complete_json(self, prompt: str, model: str, **kwargs) -> dict:
         return {"primary_area": "civil", "secondary_areas": ["business"], "confidence": 0.8, "reason": "ok"}
 
 

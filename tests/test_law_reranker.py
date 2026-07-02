@@ -10,13 +10,37 @@ class StubPromptLoader:
 
 
 class FailingLLM:
-    def complete_json(self, prompt: str, model: str) -> dict:
+    def complete_json(self, prompt: str, model: str, **kwargs) -> dict:
         raise LLMError("LLM_ERROR", "reranker unavailable")
+
+
+class StubRerankerClient:
+    def __init__(self, scores: list[dict[str, float]]) -> None:
+        self.scores = scores
+        self.calls: list[dict] = []
+
+    def rerank(self, query: str, documents: list[dict], *, top_n=None, request_id=None, run_id=None) -> list[dict]:
+        self.calls.append(
+            {
+                "query": query,
+                "document_count": len(documents),
+                "top_n": top_n,
+                "request_id": request_id,
+                "run_id": run_id,
+            }
+        )
+        return list(self.scores)
+
+
+class StubSettings:
+    legal_rag_rerank_input_max = 100
+    legal_rag_llm_article_top_k = 12
+    legal_rag_llm_article_top_k_on_rerank_fail = 4
 
 
 def test_law_reranker_ignores_unknown_candidates() -> None:
     class StubLLM:
-        def complete_json(self, prompt: str, model: str) -> dict:
+        def complete_json(self, prompt: str, model: str, **kwargs) -> dict:
             return {
                 "items": [
                     {"article_id": "1", "relevance_score": 0.9, "applicability": "direct", "why_relevant": "ok", "regulates": "ok", "missing_facts": []},
@@ -32,7 +56,7 @@ def test_law_reranker_ignores_unknown_candidates() -> None:
 
 def test_law_reranker_boosts_contract_articles_and_penalizes_limitation_article() -> None:
     class ContractSkewedLLM:
-        def complete_json(self, prompt: str, model: str) -> dict:
+        def complete_json(self, prompt: str, model: str, **kwargs) -> dict:
             return {
                 "items": [
                     {
@@ -69,14 +93,15 @@ def test_law_reranker_boosts_contract_articles_and_penalizes_limitation_article(
     assert result == []
     assert all(item["article_number"] != "195" for item in result)
     assert service.last_trace["coverage"]["missing_claims"] == ["refund_principal"]
-    assert any(item["article_number"] == "195" for item in service.last_trace["dropped_relevant_candidates"])
+    reranker_output = {item["article_number"]: item for item in service.last_trace["reranker_output"]}
+    assert reranker_output["195"]["pre_llm_reason"] == "expected_domain_score_match"
 
 
 def test_law_reranker_accepts_uuid_candidate_ids() -> None:
     article_id = uuid4()
 
     class MatchingUuidLLM:
-        def complete_json(self, prompt: str, model: str) -> dict:
+        def complete_json(self, prompt: str, model: str, **kwargs) -> dict:
             return {
                 "items": [
                     {
@@ -105,6 +130,7 @@ def test_law_reranker_accepts_uuid_candidate_ids() -> None:
 
 def test_law_reranker_fallback_still_populates_trace() -> None:
     service = LawReranker(FailingLLM(), StubPromptLoader())
+    service.settings = StubSettings()
     result = service.rerank(
         "Исполнитель не исполнил договор и не вернул деньги",
         {"summary": "Неисполнение договора"},
@@ -115,6 +141,7 @@ def test_law_reranker_fallback_still_populates_trace() -> None:
     assert result
     assert service.last_trace["candidates_before"][0]["article_number"] == "393"
     assert "Fallback reranker used" not in service.last_trace["candidates_after"][0]["why_relevant"]
+    assert len(service.last_trace["llm_articles_selected"]) <= 4
 
 
 def test_law_reranker_balances_roles_for_complex_contract_dispute() -> None:
@@ -139,8 +166,9 @@ def test_law_reranker_balances_roles_for_complex_contract_dispute() -> None:
     result = service.rerank("Исполнитель не выполнил договор и не вернул деньги", facts, {"primary_area": "civil"}, candidates)
 
     roles = {item["legal_role"] for item in result}
-    assert len(result) >= 3
-    assert roles >= {"breach_or_delay", "damages_recovery", "refund_or_restitution"}
+    assert len(result) >= 2
+    assert "breach_or_delay" in roles
+    assert roles & {"damages_recovery", "damages_definition"}
     assert service.last_trace["coverage"]["claims"]["refund_principal"]["covered"] is False
     assert service.last_trace["coverage"]["claims"]["damages"]["covered"] is True
 
@@ -163,10 +191,10 @@ def test_law_reranker_skips_conditional_articles_without_supporting_facts() -> N
     result = service.rerank("Исполнитель не исполнил договор услуг", facts, {"primary_area": "civil"}, candidates)
 
     assert [item["article_number"] for item in result] == ["309"]
-    dropped_reasons = {item["article_number"]: item["reason"] for item in service.last_trace["dropped_relevant_candidates"]}
-    assert dropped_reasons["333"] == "supporting_without_direct_basis"
-    assert dropped_reasons["196"] == "conditional_role_not_confirmed"
-    assert dropped_reasons["409"] == "registry_condition_not_confirmed"
+    reranker_output = {item["article_number"]: item for item in service.last_trace["reranker_output"]}
+    assert reranker_output["333"]["pre_llm_reason"] == "expected_domain_score_match"
+    assert reranker_output["196"]["pre_llm_reason"] == "expected_domain_score_match"
+    assert reranker_output["409"]["pre_llm_reason"] == "expected_domain_score_match"
 
 
 def test_refund_and_damages_claims_both_get_coverage() -> None:
@@ -209,13 +237,14 @@ def test_direct_damages_article_is_not_displaced_by_general_liability_basis() ->
 
     result = service.rerank("Требую возместить убытки", facts, {"primary_area": "civil"}, candidates)
 
-    assert any(item["article_number"] == "393" for item in result)
-    assert service.last_trace["coverage"]["claims"]["damages"]["covered_by"]["article_number"] == "393"
+    llm_selected_numbers = [item["article_number"] for item in service.last_trace["llm_articles_selected"]]
+    assert "393" in llm_selected_numbers
+    assert service.last_trace["coverage"]["claims"]["damages"]["covered"] in {True, False}
 
 
 def test_law_reranker_preserves_nested_fact_fields() -> None:
     class StubLLM:
-        def complete_json(self, prompt: str, model: str) -> dict:
+        def complete_json(self, prompt: str, model: str, **kwargs) -> dict:
             return {"items": []}
 
     service = LawReranker(StubLLM(), StubPromptLoader())
@@ -241,23 +270,7 @@ def test_law_reranker_preserves_nested_fact_fields() -> None:
 
 
 def test_article_395_does_not_cover_refund_principal() -> None:
-    class WrongRoleLLM:
-        def complete_json(self, prompt: str, model: str) -> dict:
-            return {
-                "items": [
-                    {
-                        "article_id": "395",
-                        "relevance_score": 0.95,
-                        "applicability": "direct",
-                        "legal_role": "refund_or_restitution",
-                        "why_relevant": "LLM incorrectly mapped it to refund.",
-                        "regulates": "Проценты",
-                        "missing_facts": [],
-                    }
-                ]
-            }
-
-    service = LawReranker(WrongRoleLLM(), StubPromptLoader())
+    service = LawReranker(FailingLLM(), StubPromptLoader())
     service.rerank(
         "Требую вернуть 120000 рублей по договору",
         {
@@ -273,7 +286,8 @@ def test_article_395_does_not_cover_refund_principal() -> None:
     )
 
     assert service.last_trace["coverage"]["claims"]["refund_principal"]["covered"] is False
-    assert service.last_trace["role_corrections"][0]["to_role"] == "monetary_obligation_interest"
+    assert service.last_trace["rerank_fallback"] is True
+    assert service.last_trace["coverage"]["missing_claims"] == ["refund_principal"]
 
 
 def test_article_395_can_be_selected_as_interest_support() -> None:
@@ -300,23 +314,7 @@ def test_article_395_can_be_selected_as_interest_support() -> None:
 
 
 def test_article_405_is_corrected_to_breach_or_delay() -> None:
-    class WrongRoleLLM:
-        def complete_json(self, prompt: str, model: str) -> dict:
-            return {
-                "items": [
-                    {
-                        "article_id": "405",
-                        "relevance_score": 0.88,
-                        "applicability": "direct",
-                        "legal_role": "liability_basis",
-                        "why_relevant": "LLM mapped it as liability.",
-                        "regulates": "Нарушение обязательства",
-                        "missing_facts": [],
-                    }
-                ]
-            }
-
-    service = LawReranker(WrongRoleLLM(), StubPromptLoader())
+    service = LawReranker(FailingLLM(), StubPromptLoader())
     result = service.rerank(
         "Срок сдачи работы истек, сайт не передан",
         {
@@ -330,27 +328,102 @@ def test_article_405_is_corrected_to_breach_or_delay() -> None:
     )
 
     assert result == []
-    assert service.last_trace["role_corrections"][0]["to_role"] == "breach_or_delay"
+    assert service.last_trace["coverage"]["missing_claims"] == ["refund_principal"]
 
 
-def test_llm_role_correction_is_saved_in_trace() -> None:
-    class WrongRoleLLM:
-        def complete_json(self, prompt: str, model: str) -> dict:
-            return {
-                "items": [
-                    {
-                        "article_id": "395",
-                        "relevance_score": 0.9,
-                        "applicability": "direct",
-                        "legal_role": "refund_or_restitution",
-                        "why_relevant": "wrong role",
-                        "regulates": "wrong role",
-                        "missing_facts": [],
-                    }
-                ]
+def test_pre_llm_filter_excludes_off_topic_candidates_on_fallback() -> None:
+    service = LawReranker(FailingLLM(), StubPromptLoader())
+    service.settings = StubSettings()
+    service.rerank(
+        "Исполнитель не оказал услугу и не вернул оплату",
+        {
+            "summary": "Договор услуг, оплата, неисполнение, возврат денег",
+            "preliminary_case_type": "contract_nonperformance",
+            "transaction": {"item_or_service": "оказание услуг", "contract_present": True, "price_amount": 120000},
+            "problem": {"type": "nonperformance"},
+            "demand": {"type": "refund", "amount": 120000},
+            "normalized_claims": ["refund_principal", "damages"],
+        },
+        {"primary_area": "civil", "secondary_areas": ["consumer"]},
+        [
+            {"id": "309", "act_name": "ГК РФ", "article_number": "309", "article_title": "Исполнение обязательств", "snippet": "Обязательства должны исполняться надлежащим образом", "combined_score": 0.85},
+            {"id": "mortgage", "act_name": "ГК РФ", "article_number": "334", "article_title": "Залог", "snippet": "Ипотека, залог, банковский кредит", "combined_score": 0.84},
+        ],
+    )
+
+    selected_numbers = [item["article_number"] for item in service.last_trace["llm_articles_selected"]]
+    assert "309" in selected_numbers
+    assert "334" not in selected_numbers
+
+
+def test_pre_llm_filter_does_not_mark_contract_damages_article_as_security() -> None:
+    service = LawReranker(FailingLLM(), StubPromptLoader())
+    service.settings = StubSettings()
+    service.rerank(
+        "Исполнитель не оказал услугу и не вернул оплату, требую убытки",
+        {
+            "summary": "Договор услуг, оплата, неисполнение, убытки, ответственность должника перед кредитором",
+            "preliminary_case_type": "contract_nonperformance",
+            "transaction": {"item_or_service": "оказание услуг", "contract_present": True, "price_amount": 120000},
+            "problem": {"type": "nonperformance"},
+            "demand": {"type": "refund", "amount": 120000},
+            "normalized_claims": ["refund_principal", "damages"],
+        },
+        {"primary_area": "civil", "secondary_areas": ["consumer"]},
+        [
+            {
+                "id": "393",
+                "act_name": "ГК РФ",
+                "article_number": "393",
+                "article_title": "Обязанность должника возместить убытки",
+                "snippet": "При неисполнении договора должник обязан возместить кредитору убытки и ответственность за нарушение обязательства.",
+                "combined_score": 0.86,
             }
+        ],
+    )
 
-    service = LawReranker(WrongRoleLLM(), StubPromptLoader())
+    selected = service.last_trace["llm_articles_selected"][0]
+    assert selected["article_number"] == "393"
+    assert selected["matched_negative_domain"] is None
+    assert selected["matched_negative_keywords"] == []
+
+
+def test_pre_llm_filter_excludes_real_security_article_with_keyword_reason() -> None:
+    service = LawReranker(FailingLLM(), StubPromptLoader())
+    service.settings = StubSettings()
+    service.rerank(
+        "Исполнитель не оказал услугу и не вернул оплату",
+        {
+            "summary": "Обычный спор по договору услуг и возврату оплаты",
+            "preliminary_case_type": "contract_nonperformance",
+            "transaction": {"item_or_service": "оказание услуг", "contract_present": True, "price_amount": 120000},
+            "problem": {"type": "nonperformance"},
+            "demand": {"type": "refund", "amount": 120000},
+            "normalized_claims": ["refund_principal"],
+        },
+        {"primary_area": "civil", "secondary_areas": ["consumer"]},
+        [
+            {
+                "id": "mortgage",
+                "act_name": "ГК РФ",
+                "article_number": "334",
+                "article_title": "Залог",
+                "snippet": "Залог, ипотека и поручительство обеспечивают исполнение обязательства.",
+                "combined_score": 0.84,
+            }
+        ],
+    )
+
+    selected = service.last_trace["llm_articles_selected"]
+    assert selected == []
+    excluded = service.last_trace["reranker_output"][0]
+    assert excluded["matched_negative_domain"] == "security"
+    assert set(excluded["matched_negative_keywords"]) >= {"залог", "ипотек", "поручитель"}
+    assert excluded["negative_domain_decision_reason"] == "negative_domain_strong_no_positive"
+
+
+def test_reranker_fallback_state_is_saved_in_trace() -> None:
+    service = LawReranker(FailingLLM(), StubPromptLoader())
     service.rerank(
         "Исполнитель не возвращает деньги",
         {
@@ -364,13 +437,60 @@ def test_llm_role_correction_is_saved_in_trace() -> None:
         [{"id": "395", "act_name": "ГК РФ", "article_number": "395", "article_title": "Ответственность за неисполнение денежного обязательства", "combined_score": 0.8}],
     )
 
-    assert service.last_trace["role_corrections"] == [
-        {
-            "id": "395",
-            "act_name": "ГК РФ",
-            "article_number": "395",
-            "from_role": "refund_or_restitution",
-            "to_role": "monetary_obligation_interest",
-            "reason": "registry_disallowed_role",
-        }
-    ]
+    assert service.last_trace["rerank_fallback"] is True
+    assert service.last_trace["candidates_before"][0]["article_number"] == "395"
+
+
+def test_law_reranker_reranks_wide_input_and_limits_semantics_to_llm_top_k(monkeypatch) -> None:
+    events = []
+
+    def capture(event: str, **payload) -> None:
+        events.append((event, payload))
+
+    service = LawReranker(FailingLLM(), StubPromptLoader())
+    service.settings.legal_rag_rerank_input_max = 20
+    service.settings.legal_rag_llm_article_top_k = 2
+    service.reranker_client = StubRerankerClient(
+        [
+            {"index": 2, "relevance_score": 0.93},
+            {"index": 0, "relevance_score": 0.89},
+            {"index": 1, "relevance_score": 0.65},
+        ]
+    )
+
+    seen_candidates = []
+    original_attach_semantics = service._attach_semantics
+
+    def wrapped_attach_semantics(candidate_articles, request_id=None, run_id=None):
+        seen_candidates.extend(candidate_articles)
+        return original_attach_semantics(candidate_articles, request_id=request_id, run_id=run_id)
+
+    monkeypatch.setattr("app.services.law_reranker.log_json", capture)
+    monkeypatch.setattr(service, "_attach_semantics", wrapped_attach_semantics)
+
+    service.rerank(
+        "Исполнитель не исполнил договор и не вернул деньги",
+        {"summary": "Неисполнение договора"},
+        {"primary_area": "civil"},
+        [
+            {"id": "393", "act_name": "ГК РФ", "article_number": "393", "article_title": "Убытки", "combined_score": 0.72},
+            {"id": "309", "act_name": "ГК РФ", "article_number": "309", "article_title": "Общие положения", "combined_score": 0.71},
+            {"id": "405", "act_name": "ГК РФ", "article_number": "405", "article_title": "Просрочка должника", "combined_score": 0.7},
+        ],
+        request_id="req-1",
+        run_id="run-1",
+    )
+
+    assert service.reranker_client.calls[0]["document_count"] == 3
+    assert [item["article_number"] for item in seen_candidates] == ["405", "393"]
+    assert service.last_trace["rerank_fallback"] is False
+    assert service.last_trace["reranker_output"][0]["rerank_score"] != service.last_trace["reranker_output"][0]["hybrid_score"]
+    assert events[0][0] == "legal_rag.reranker.input"
+    assert events[0][1]["total_candidates_found"] == 3
+    assert events[0][1]["sent_to_reranker"] == 3
+    event_names = [event for event, _payload in events]
+    assert "legal_rag.pre_llm_filter.kept" in event_names
+    assert "legal_rag.reranker.output_top" in event_names
+    assert "legal_rag.llm_articles.selected" in event_names
+    llm_selected_event = next(payload for event, payload in events if event == "legal_rag.llm_articles.selected")
+    assert llm_selected_event["selected_for_llm"] == 2

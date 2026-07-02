@@ -10,12 +10,12 @@ class StubPromptLoader:
 
 
 class EmptyLLM:
-    def complete_json(self, prompt: str, model: str) -> dict:
+    def complete_json(self, prompt: str, model: str, **kwargs) -> dict:
         return {"items": []}
 
 
 class OkLLM:
-    def complete_json(self, prompt: str, model: str) -> dict:
+    def complete_json(self, prompt: str, model: str, **kwargs) -> dict:
         return {"status": "ok", "confidence": 1.0, "has_direct_basis": True, "missing_facts": [], "warnings": []}
 
 
@@ -101,6 +101,95 @@ def test_special_refusal_ground_does_not_directly_cover_generic_damages() -> Non
 
     assert coverage["claims"]["damages"]["covered"] is False
     assert "regulatory_license_missing" in coverage["claims"]["damages"]["blocked_by_missing_facts"]
+
+
+def test_special_indemnity_clause_does_not_cover_generic_damages_without_contract_condition() -> None:
+    analyzer = ArticleSemanticAnalyzer()
+    checker = ClaimEntailmentChecker()
+    article = {
+        "id": "special_indemnity",
+        "article_title": "Возмещение потерь по соглашению сторон",
+        "article_text": "Стороны обязательства, действуя при осуществлении ими предпринимательской деятельности, могут своим соглашением предусмотреть обязанность одной стороны возместить другой стороне имущественные потери.",
+    }
+    article["semantic_analysis"] = analyzer.analyze(article)
+
+    effect = next(
+        effect
+        for effect in article["semantic_analysis"]["legal_effects"]
+        if effect["effect_type"] == "damages_recovery"
+    )
+    coverage = checker.build_coverage(["damages"], [article], {"summary": "Исполнитель не выполнил договор услуг"}, "хочу взыскать убытки")
+
+    assert effect["effect_scope"] == "special_conditional"
+    assert "special_indemnity_agreement" in effect["trigger_conditions"]
+    assert coverage["claims"]["damages"]["covered"] is False
+    assert "special_indemnity_agreement" in coverage["claims"]["damages"]["blocked_by_missing_facts"]
+
+
+def test_refund_claim_is_not_closed_by_damages_only_effect() -> None:
+    analyzer = ArticleSemanticAnalyzer()
+    checker = ClaimEntailmentChecker()
+    article = {
+        "id": "damages_only",
+        "article_title": "Возмещение убытков",
+        "article_text": "Лицо, право которого нарушено, может требовать полного возмещения причиненных ему убытков.",
+    }
+    article["semantic_analysis"] = analyzer.analyze(article)
+
+    coverage = checker.build_coverage(["refund_principal"], [article], {"summary": "Исполнитель не вернул оплату по договору услуг"}, "вернуть деньги")
+
+    assert coverage["claims"]["refund_principal"]["covered"] is False
+    assert coverage["claims"]["refund_principal"]["coverage_type"] == "missing"
+
+
+def test_article_167_is_downgraded_without_invalid_transaction_context() -> None:
+    checker = ClaimEntailmentChecker()
+    article = {
+        "id": "167",
+        "article_number": "167",
+        "article_title": "Общие положения о последствиях недействительности сделки",
+        "article_text": "Недействительная сделка не влечет юридических последствий. Каждая из сторон обязана возвратить другой все полученное по сделке.",
+        "semantic_analysis": {
+            "legal_effects": [
+                {
+                    "effect_type": "return_received",
+                    "effect_scope": "general_direct",
+                    "effect_description": "Возврат полученного по сделке.",
+                    "trigger_conditions": [],
+                    "evidence_quote": "каждая из сторон обязана возвратить другой все полученное по сделке",
+                }
+            ]
+        },
+    }
+
+    coverage = checker.build_coverage(
+        ["refund_principal"],
+        [article],
+        {"summary": "Исполнитель не оказал услугу и не вернул оплату по договору услуг"},
+        "хочу вернуть деньги за неоказанную услугу",
+    )
+
+    assert coverage["claims"]["refund_principal"]["covered"] is False
+    assert coverage["claims"]["refund_principal"]["coverage_type"] in {"missing", "blocked_by_missing_facts"}
+    entry = coverage["coverage_map"][0]
+    assert entry["guard_downgraded"] is True
+    assert entry["guard_reason"] == "article_167_requires_invalid_transaction_context"
+
+
+def test_damages_claim_is_not_closed_by_penalty_or_security_effect() -> None:
+    analyzer = ArticleSemanticAnalyzer()
+    checker = ClaimEntailmentChecker()
+    article = {
+        "id": "penalty_only",
+        "article_title": "Понятие неустойки",
+        "article_text": "Неустойкой признается денежная сумма, которую должник обязан уплатить кредитору в случае неисполнения обязательства.",
+    }
+    article["semantic_analysis"] = analyzer.analyze(article)
+
+    coverage = checker.build_coverage(["damages"], [article], {"summary": "Исполнитель не выполнил договор услуг"}, "хочу взыскать убытки")
+
+    assert coverage["claims"]["damages"]["covered"] is False
+    assert coverage["claims"]["damages"]["coverage_type"] in {"missing", "blocked_by_missing_facts"}
 
 
 def test_supporting_article_does_not_close_primary_claim_without_direct_basis() -> None:

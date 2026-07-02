@@ -34,7 +34,11 @@ class LegalContextValidator:
             .replace("{{LEGAL_CONTEXT}}", json.dumps(legal_context, ensure_ascii=False))
         )
         try:
-            result = self.litellm_client.complete_json(prompt, self.settings.litellm_main_model)
+            result = self.litellm_client.complete_json(
+                prompt,
+                self.settings.legal_context_validator_model,
+                stage="legal_context_validation",
+            )
         except LLMError:
             result = self._fallback_validation(legal_context)
         self.last_trace = self._build_trace(legal_context, result)
@@ -62,10 +66,10 @@ class LegalContextValidator:
             {
                 "claim": entry.get("claim"),
                 "article_number": entry.get("article_number"),
-                "missing_facts": entry.get("missing_facts"),
+                "missing_facts": entry.get("missing_conditions") or entry.get("missing_facts"),
             }
             for entry in entries
-            if entry.get("coverage_type") == "conditional_missing_facts" and entry.get("missing_facts")
+            if entry.get("coverage_type") == "conditional_missing_facts" and (entry.get("missing_conditions") or entry.get("missing_facts"))
         ]
         has_direct_basis = any(entry.get("coverage_type") in {"direct", "valid_conditional"} for entry in entries if entry.get("counts_as_covered"))
 

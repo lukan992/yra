@@ -20,6 +20,10 @@ class LawRepository:
         rows = self.db.query(LawArticle.act_name).filter(LawArticle.is_active.is_(True)).distinct().all()
         return [str(row[0]) for row in rows if row and row[0]]
 
+    def get_active_act_types(self) -> list[str]:
+        rows = self.db.query(LawArticle.act_type).filter(LawArticle.is_active.is_(True)).distinct().all()
+        return [str(row[0]) for row in rows if row and row[0]]
+
     def keyword_search_candidates(
         self,
         query: str,

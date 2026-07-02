@@ -1,0 +1,1 @@
+FROM Krakekai/qwen3-reranker-8b:latest

@@ -47,6 +47,13 @@ class ClaimPipeline:
         "why_relevant",
         "legal_role",
         "coverage_type",
+        "claim_type",
+        "effect_type",
+        "effect_scope",
+        "user_visible",
+        "trigger_conditions_satisfied",
+        "missing_conditions",
+        "visible",
         "coverage_evidence_quote",
         "coverage_trigger_conditions",
         "semantic_summary",
@@ -85,7 +92,12 @@ class ClaimPipeline:
         self.hybrid_law_retriever = HybridLawRetriever(self.law_repository, self.embedding_service)
         self.law_reranker = LawReranker(self.llm_client, self.prompt_loader)
         self.law_retriever = LawRetriever(self.hybrid_law_retriever, self.law_reranker)
-        self.law_graph_expander = LawGraphExpander(self.law_repository, LawReferenceExtractor())
+        self.law_graph_expander = LawGraphExpander(
+            self.law_repository,
+            LawReferenceExtractor(),
+            semantic_analyzer=self.law_reranker.semantic_analyzer,
+            entailment_checker=self.law_reranker.entailment_checker,
+        )
         self.legal_context_validator = LegalContextValidator(self.llm_client, self.prompt_loader)
         self.claim_evaluator = ClaimEvaluator(self.llm_client, self.prompt_loader)
         self.claim_generator = ClaimGenerator(self.llm_client, self.prompt_loader)
@@ -154,6 +166,7 @@ class ClaimPipeline:
 
             started_at = time.perf_counter()
             query_payload = self.law_query_builder.build(user_text, facts, legal_area)
+            query_payload = self._ensure_query_payload(user_text, facts, legal_area, query_payload, request_id, run_id)
             query_duration_ms = self._duration_ms(started_at)
             self._step(
                 request_id,
@@ -182,10 +195,29 @@ class ClaimPipeline:
                     if isinstance(act_type, str)
                 ],
             )
+            if self.law_query_builder.last_trace.get("fallback_used"):
+                log_json(
+                    "legal_rag.query_builder.fallback_used",
+                    request_id=request_id,
+                    run_id=run_id,
+                    step="law_query_building",
+                    duration_ms=query_duration_ms,
+                    reason=self.law_query_builder.last_trace.get("fallback_reason"),
+                    query=self.law_query_builder.last_trace.get("query"),
+                    keywords=self._list_or_empty(self.law_query_builder.last_trace.get("keywords")),
+                    expected_acts=self._list_or_empty(self.law_query_builder.last_trace.get("expected_acts_raw")),
+                )
 
             try:
                 started_at = time.perf_counter()
-                retrieval_candidates, used_laws = self.law_retriever.retrieve(user_text, facts, legal_area, query_payload)
+                retrieval_candidates, used_laws = self.law_retriever.retrieve(
+                    user_text,
+                    facts,
+                    legal_area,
+                    query_payload,
+                    request_id=request_id,
+                    run_id=run_id,
+                )
                 retrieval_duration_ms = self._duration_ms(started_at)
             except LegalContextNotFoundError as exc:
                 self._step(
@@ -196,6 +228,20 @@ class ClaimPipeline:
                     {"user_text": user_meta, "facts": facts, "legal_area": legal_area, "query_payload": query_payload},
                     error_json={"code": exc.code, "message": exc.message},
                     duration_ms=self._duration_ms(started_at),
+                )
+                self._trace_rag(
+                    request_id,
+                    run_id,
+                    "hybrid_law_retrieval",
+                    float(self.law_retriever.last_trace.get("hybrid_retrieval_duration_ms") or self._duration_ms(started_at)),
+                    **user_meta,
+                    **self.hybrid_law_retriever.last_trace,
+                )
+                self._log_retriever_diagnostics(
+                    request_id,
+                    run_id,
+                    float(self.law_retriever.last_trace.get("hybrid_retrieval_duration_ms") or self._duration_ms(started_at)),
+                    self.hybrid_law_retriever.last_trace,
                 )
                 raise
 
@@ -215,6 +261,12 @@ class ClaimPipeline:
                 float(self.law_retriever.last_trace.get("hybrid_retrieval_duration_ms") or retrieval_duration_ms),
                 **user_meta,
                 **self.hybrid_law_retriever.last_trace,
+            )
+            self._log_retriever_diagnostics(
+                request_id,
+                run_id,
+                float(self.law_retriever.last_trace.get("hybrid_retrieval_duration_ms") or retrieval_duration_ms),
+                self.hybrid_law_retriever.last_trace,
             )
             self._step(
                 request_id,
@@ -244,7 +296,14 @@ class ClaimPipeline:
                 facts["normalized_claims"] = normalized_claims
             self._log_repair_diagnostics(request_id, run_id, self.law_retriever.last_trace)
             started_at = time.perf_counter()
-            used_laws = self.law_graph_expander.expand(used_laws, facts=facts, user_text=user_text, normalized_claims=normalized_claims)
+            used_laws = self.law_graph_expander.expand(
+                used_laws,
+                facts=facts,
+                user_text=user_text,
+                normalized_claims=normalized_claims,
+                request_id=request_id,
+                run_id=run_id,
+            )
             used_laws = self._filter_user_visible_articles(used_laws, request_id, run_id)
             graph_duration_ms = self._duration_ms(started_at)
             self._step(request_id, run.id, "law_graph_expansion", "completed", {"used_laws": used_laws}, used_laws, duration_ms=graph_duration_ms)
@@ -621,6 +680,39 @@ class ClaimPipeline:
     ) -> None:
         if not self.settings.log_rag_trace:
             return
+        reranker_input = trace.get("candidates_before")
+        if isinstance(reranker_input, list) and reranker_input:
+            log_json(
+                "legal_rag.reranker.input",
+                request_id=request_id,
+                run_id=run_id,
+                step="law_reranking",
+                duration_ms=duration_ms,
+                sent_to_reranker=len(reranker_input),
+                candidates=self._compact_trace_payload(reranker_input[:12]),
+            )
+        reranker_output = trace.get("reranker_output")
+        if isinstance(reranker_output, list) and reranker_output:
+            log_json(
+                "legal_rag.reranker.output_top",
+                request_id=request_id,
+                run_id=run_id,
+                step="law_reranking",
+                duration_ms=duration_ms,
+                rerank_fallback=bool(trace.get("rerank_fallback")),
+                articles=self._compact_trace_payload(reranker_output[:12]),
+            )
+        llm_selected = trace.get("llm_articles_selected")
+        if isinstance(llm_selected, list) and llm_selected:
+            log_json(
+                "legal_rag.llm_articles.selected",
+                request_id=request_id,
+                run_id=run_id,
+                step="law_reranking",
+                duration_ms=duration_ms,
+                selected_for_llm=len(llm_selected),
+                articles=self._compact_trace_payload(llm_selected),
+            )
         coverage = trace.get("coverage")
         if isinstance(coverage, dict):
             log_json(
@@ -718,6 +810,53 @@ class ClaimPipeline:
                     duration_ms=duration_ms,
                     blocked_by_missing_facts=self._compact_trace_payload(blocked),
                 )
+            guard_downgraded = [
+                entry
+                for entry in self._list_or_empty(coverage.get("coverage_map"))
+                if isinstance(entry, dict) and entry.get("guard_downgraded")
+            ]
+            if guard_downgraded:
+                log_json(
+                    "legal_rag.coverage_guard.downgraded",
+                    request_id=request_id,
+                    run_id=run_id,
+                    step="law_reranking",
+                    duration_ms=duration_ms,
+                    articles=self._compact_trace_payload(guard_downgraded),
+                )
+
+    def _log_retriever_diagnostics(
+        self,
+        request_id: str,
+        run_id: str,
+        duration_ms: float,
+        trace: dict[str, Any],
+    ) -> None:
+        if not self.settings.log_rag_trace:
+            return
+        for event_name in (
+            "legal_rag.retrieval.candidates_found",
+            "legal_rag.retriever.query_input",
+            "legal_rag.retriever.raw_candidates",
+            "legal_rag.retriever.after_act_filter",
+            "legal_rag.retriever.after_act_type_filter",
+            "legal_rag.retriever.after_threshold",
+            "legal_rag.retriever.relaxed_retry",
+            "legal_rag.retriever.dropped_by_reason",
+            "legal_rag.retriever.final_candidates",
+        ):
+            payload = trace.get(event_name)
+            if not payload:
+                continue
+            compact_payload = self._compact_trace_payload(payload)
+            log_json(
+                event_name,
+                request_id=request_id,
+                run_id=run_id,
+                step="hybrid_law_retrieval",
+                duration_ms=duration_ms,
+                **(compact_payload if isinstance(compact_payload, dict) else {"payload": compact_payload}),
+            )
 
     def _log_repair_diagnostics(self, request_id: str, run_id: str, trace: dict[str, Any]) -> None:
         if not self.settings.log_rag_trace:
@@ -745,13 +884,30 @@ class ClaimPipeline:
         )
 
     def _filter_user_visible_articles(self, legal_context: list[dict[str, Any]], request_id: str, run_id: str) -> list[dict[str, Any]]:
-        has_direct_basis = any(article.get("coverage_type") in {"direct", "valid_conditional"} for article in legal_context)
         result: list[dict[str, Any]] = []
+        diagnostics: list[dict[str, Any]] = []
         for article in legal_context:
-            coverage_type = str(article.get("coverage_type") or "")
-            if coverage_type in {"direct", "valid_conditional"}:
-                result.append(article)
-            elif coverage_type == "supporting" and has_direct_basis:
+            entries = article.get("coverage") if isinstance(article.get("coverage"), list) else []
+            visible_entries = [entry for entry in entries if isinstance(entry, dict) and entry.get("user_visible")]
+            for entry in [entry for entry in entries if isinstance(entry, dict)]:
+                diagnostics.append(
+                    {
+                        "id": str(article.get("id") or ""),
+                        "act_name": article.get("act_name") or article.get("law_name"),
+                        "article_number": article.get("article_number"),
+                        "article_title": article.get("article_title") or article.get("title"),
+                        "claim_type": entry.get("claim"),
+                        "effect_type": entry.get("effect_type"),
+                        "effect_scope": entry.get("effect_scope"),
+                        "coverage_type": entry.get("coverage_type"),
+                        "user_visible": bool(entry.get("user_visible")),
+                        "trigger_conditions_satisfied": bool(entry.get("trigger_conditions_satisfied")),
+                        "missing_conditions": entry.get("missing_conditions") or [],
+                        "reason": entry.get("reason"),
+                    }
+                )
+            if visible_entries:
+                article["user_visible_claims"] = [str(entry.get("claim") or "") for entry in visible_entries if str(entry.get("claim") or "")]
                 result.append(article)
         if self.settings.log_rag_trace:
             log_json(
@@ -760,9 +916,53 @@ class ClaimPipeline:
                 run_id=run_id,
                 step="formatter",
                 duration_ms=0.0,
-                articles=self._compact_trace_payload(result),
+                articles=self._compact_trace_payload(diagnostics),
             )
         return result
+
+    @staticmethod
+    def _strongest_user_visible_coverage(article: dict[str, Any]) -> dict[str, Any] | None:
+        entries = article.get("coverage") if isinstance(article.get("coverage"), list) else []
+        valid_entries = [entry for entry in entries if isinstance(entry, dict)]
+        strongest = next((entry for entry in valid_entries if entry.get("coverage_type") == "direct"), None)
+        strongest = strongest or next((entry for entry in valid_entries if entry.get("coverage_type") == "valid_conditional"), None)
+        strongest = strongest or next((entry for entry in valid_entries if entry.get("coverage_type") == "conditional_missing_facts"), None)
+        strongest = strongest or next((entry for entry in valid_entries if entry.get("coverage_type") == "supporting"), None)
+        return strongest
+
+    def _ensure_query_payload(
+        self,
+        user_text: str,
+        facts: dict[str, Any],
+        legal_area: dict[str, Any],
+        query_payload: dict[str, Any],
+        request_id: str,
+        run_id: str,
+    ) -> dict[str, Any]:
+        legal_query = str(query_payload.get("legal_query") or query_payload.get("plain_problem") or "").strip() if isinstance(query_payload, dict) else ""
+        keywords = query_payload.get("keywords") if isinstance(query_payload, dict) and isinstance(query_payload.get("keywords"), list) else []
+        if legal_query and keywords:
+            return query_payload
+        fallback_reason = "empty_payload" if not query_payload else "missing_legal_query" if not legal_query else "missing_keywords"
+        repaired = self.law_query_builder.ensure_query_payload(
+            user_text,
+            facts,
+            legal_area,
+            query_payload if isinstance(query_payload, dict) else None,
+            fallback_reason=fallback_reason,
+        )
+        log_json(
+            "legal_rag.query_builder.fallback_used",
+            request_id=request_id,
+            run_id=run_id,
+            step="law_query_building",
+            duration_ms=0.0,
+            reason=fallback_reason,
+            query=self.law_query_builder.last_trace.get("query"),
+            keywords=self._list_or_empty(self.law_query_builder.last_trace.get("keywords")),
+            expected_acts=self._list_or_empty(self.law_query_builder.last_trace.get("expected_acts_raw")),
+        )
+        return repaired
 
     @staticmethod
     def _duration_ms(started_at: float) -> float:
@@ -924,6 +1124,9 @@ class ClaimPipeline:
             evaluation.get("clarifying_questions") if evaluation else None,
             guidance.get("clarifying_questions") if guidance else None,
         )
+        if error and error.code == "LEGAL_CONTEXT_NOT_FOUND":
+            missing_fields = []
+            clarifying_questions = []
         return ClaimAnalyzeResponse(
             status=status,
             request_id=str(request_id),

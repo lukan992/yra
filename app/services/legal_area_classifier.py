@@ -20,7 +20,11 @@ class LegalAreaClassifier:
             .replace("{{FACTS}}", json.dumps(facts, ensure_ascii=False))
         )
         try:
-            return self.litellm_client.complete_json(prompt, self.settings.litellm_main_model)
+            return self.litellm_client.complete_json(
+                prompt,
+                self.settings.legal_area_classifier_model,
+                stage="legal_area_classification",
+            )
         except LLMError:
             return self._fallback_classification(user_text, facts)
 

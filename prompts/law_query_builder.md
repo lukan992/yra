@@ -39,3 +39,14 @@
   "detected_claims": [],
   "search_notes": []
 }
+
+Входные данные:
+- `USER_TEXT`: исходное описание пользователя
+- `FACTS`: извлеченные факты
+- `LEGAL_AREA`: классификация области права, detected_claims и domain_signals
+
+Обязательные требования к ответу:
+- `legal_query` не должен быть пустым;
+- `keywords` не должны быть пустыми;
+- если есть `detected_claims` или `domain_signals`, используй их в `legal_query` и `keywords`;
+- не возвращай пустой объект.

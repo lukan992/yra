@@ -24,6 +24,8 @@ class LawGraphExpander:
         facts: dict | None = None,
         user_text: str = "",
         normalized_claims: list[str] | None = None,
+        request_id: str | None = None,
+        run_id: str | None = None,
     ) -> list[dict]:
         result: list[dict] = []
         seen_ids: set[str] = set()
@@ -53,9 +55,16 @@ class LawGraphExpander:
                 target["relation_type"] = "explicit_reference"
                 target["source_fragment"] = reference.get("source_fragment")
                 if normalized_claims:
-                    target["semantic_analysis"] = self.semantic_analyzer.analyze(target)
+                    target["semantic_analysis"] = self.semantic_analyzer.analyze(target, request_id=request_id, run_id=run_id)
                     target["legal_effects"] = target["semantic_analysis"].get("legal_effects", [])
-                    coverage = self.entailment_checker.build_coverage(normalized_claims, [target], facts or {}, user_text)
+                    coverage = self.entailment_checker.build_coverage(
+                        normalized_claims,
+                        [target],
+                        facts or {},
+                        user_text,
+                        request_id=request_id,
+                        run_id=run_id,
+                    )
                     target["coverage"] = target.get("coverage", [])
                     target["coverage_type"] = target.get("coverage_type")
                     allowed = any(

@@ -2,7 +2,7 @@ from app.services.legal_context_validator import LegalContextValidator
 
 
 class StubLLM:
-    def complete_json(self, prompt: str, model: str) -> dict:
+    def complete_json(self, prompt: str, model: str, **kwargs) -> dict:
         return {"status": "needs_clarification", "confidence": 0.4, "has_direct_basis": False, "needs_clarification": True, "missing_facts": ["срок"], "warnings": ["низкая релевантность"]}
 
 

@@ -1,7 +1,8 @@
 import time
 from typing import Any
 
-from app.schemas.pipeline import LegalContextNotFoundError
+from app.core.config import get_settings
+from app.schemas.pipeline import LegalContextNotFoundError, QueryBuilderError
 from app.services.hybrid_law_retriever import HybridLawRetriever
 from app.services.law_reranker import LawReranker
 
@@ -10,6 +11,7 @@ class LawRetriever:
     def __init__(self, hybrid_retriever: HybridLawRetriever, law_reranker: LawReranker) -> None:
         self.hybrid_retriever = hybrid_retriever
         self.law_reranker = law_reranker
+        self.settings = get_settings()
         self.last_trace: dict[str, float] = {}
 
     def retrieve(
@@ -19,32 +21,60 @@ class LawRetriever:
         legal_area: dict[str, Any],
         query_payload: dict[str, Any],
         top_k: int = 8,
+        request_id: str | None = None,
+        run_id: str | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        legal_query = str(query_payload.get("legal_query") or query_payload.get("plain_problem") or "").strip()
+        keywords = query_payload.get("keywords") if isinstance(query_payload.get("keywords"), list) else []
+        if not legal_query or not keywords:
+            raise QueryBuilderError(details={"query_payload": query_payload})
         started_at = time.perf_counter()
-        candidates = self.hybrid_retriever.retrieve(query_payload, limit=max(top_k * 6, 30))
+        retrieval_top_k = max(top_k, int(self.settings.legal_rag_retrieval_top_k))
+        final_top_k = max(1, int(self.settings.legal_rag_llm_article_top_k or self.settings.legal_rag_rerank_top_k or top_k))
+        candidates = self.hybrid_retriever.retrieve(query_payload, limit=retrieval_top_k)
         retrieval_duration_ms = round((time.perf_counter() - started_at) * 1000, 3)
         if not candidates:
             raise LegalContextNotFoundError(
-                "Не удалось подобрать достаточно релевантные нормы по текущему описанию. Нужны дополнительные факты или более конкретная формулировка спора.",
-                {"query_payload": query_payload},
+                "Не удалось подобрать релевантные нормы права по текущему описанию после всех retrieval-попыток.",
+                {
+                    "query_payload": query_payload,
+                    "retriever_trace": getattr(self.hybrid_retriever, "last_trace", {}),
+                    "reason": "missing_legal_context",
+                },
             )
         rerank_started_at = time.perf_counter()
-        reranked = self.law_reranker.rerank(user_text, facts, legal_area, candidates)
+        try:
+            reranked = self.law_reranker.rerank(user_text, facts, legal_area, candidates, request_id=request_id, run_id=run_id)
+        except TypeError:
+            reranked = self.law_reranker.rerank(user_text, facts, legal_area, candidates)
         rerank_duration_ms = round((time.perf_counter() - rerank_started_at) * 1000, 3)
         repair_trace: dict[str, Any] = {}
         missing_claims = self._missing_claims()
-        if missing_claims:
+        rerank_fallback = bool(getattr(self.law_reranker, "last_trace", {}).get("rerank_fallback"))
+        should_run_repair = bool(missing_claims) or (rerank_fallback and len(reranked) < 2)
+        if should_run_repair:
             repair_started_at = time.perf_counter()
-            repair_payload = self._build_repair_query(query_payload, facts, legal_area, missing_claims)
-            repair_candidates = self.hybrid_retriever.retrieve(repair_payload, limit=max(top_k * 4, 24))
+            repair_payload = self._build_repair_query(query_payload, facts, legal_area, missing_claims or ["refund_principal"])
+            repair_candidates = self.hybrid_retriever.retrieve(repair_payload, limit=retrieval_top_k)
             merged_candidates = self._merge_candidates(candidates, repair_candidates)
             rerank_started_at = time.perf_counter()
-            reranked = self.law_reranker.rerank(user_text, facts, legal_area, merged_candidates)
+            try:
+                reranked = self.law_reranker.rerank(
+                    user_text,
+                    facts,
+                    legal_area,
+                    merged_candidates,
+                    request_id=request_id,
+                    run_id=run_id,
+                )
+            except TypeError:
+                reranked = self.law_reranker.rerank(user_text, facts, legal_area, merged_candidates)
             rerank_duration_ms += round((time.perf_counter() - rerank_started_at) * 1000, 3)
             repair_trace = {
                 "started": True,
                 "duration_ms": round((time.perf_counter() - repair_started_at) * 1000, 3),
                 "missing_claims": missing_claims,
+                "rerank_fallback": rerank_fallback,
                 "query_payload": repair_payload,
                 "candidate_count": len(repair_candidates),
                 "result_ids": [str(item.get("id") or "") for item in repair_candidates],
@@ -57,10 +87,14 @@ class LawRetriever:
         }
         if not reranked:
             raise LegalContextNotFoundError(
-                "Найденных норм пока недостаточно для уверенного вывода. Нужны дополнительные факты или уточнение ситуации.",
-                {"query_payload": query_payload, "candidate_ids": [item["id"] for item in candidates]},
+                "Найденных норм пока недостаточно для уверенного правового вывода после semantic coverage-проверки.",
+                {
+                    "query_payload": query_payload,
+                    "candidate_ids": [item["id"] for item in candidates],
+                    "reason": "missing_legal_context",
+                },
             )
-        return candidates, reranked[:top_k]
+        return candidates, reranked[:final_top_k]
 
     def _missing_claims(self) -> list[str]:
         last_trace = getattr(self.law_reranker, "last_trace", {})
@@ -98,6 +132,32 @@ class LawRetriever:
         }
         facts_terms = LawRetriever._facts_terms(facts, legal_area)
         repair_terms = [claim_descriptions.get(claim, claim) for claim in missing_claims]
+        case_type = str(facts.get("preliminary_case_type") or "").lower()
+        transaction = facts.get("transaction") if isinstance(facts.get("transaction"), dict) else {}
+        legal_area_secondary = legal_area.get("secondary_areas") if isinstance(legal_area.get("secondary_areas"), list) else []
+        if case_type == "contract_nonperformance":
+            repair_terms.extend(
+                [
+                    "договор оказания услуг",
+                    "возмездное оказание услуг",
+                    "неисполнение обязательства",
+                    "возврат оплаты",
+                    "отказ от договора",
+                    "нарушение срока оказания услуги",
+                ]
+            )
+        if any(str(item).lower() == "consumer" for item in legal_area_secondary):
+            repair_terms.extend(
+                [
+                    "защита прав потребителей",
+                    "потребитель",
+                    "возврат уплаченной суммы потребителю",
+                    "убытки потребителя",
+                ]
+            )
+        transaction_type = str(transaction.get("type") or transaction.get("item_or_service") or "").strip()
+        if transaction_type:
+            repair_terms.append(transaction_type)
         return {
             **query_payload,
             "plain_problem": " ".join(repair_terms + facts_terms),

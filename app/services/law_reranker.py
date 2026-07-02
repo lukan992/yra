@@ -2,12 +2,15 @@ import json
 from typing import Any
 
 from app.core.config import get_settings
+from app.core.logging import log_json
 from app.schemas.pipeline import LLMError
 from app.services.article_semantic_analyzer import ArticleSemanticAnalyzer
 from app.services.article_role_registry import ArticleRoleRegistry, ArticleRoleRule
+from app.services.claim_matcher import ClaimMatcherLLM
 from app.services.claim_entailment_checker import ClaimEntailmentChecker
 from app.services.litellm_client import LiteLLMClient
 from app.services.prompt_loader import PromptLoader
+from app.services.reranker_client import RerankerClient
 
 
 class LawReranker:
@@ -37,8 +40,8 @@ class LawReranker:
     ]
     VALID_ROLES = set(ROLE_PRIORITY + ["weak_or_unrelated"])
     POSITIVE_APPLICABILITY = {"direct", "related", "weak"}
-    MAX_SELECTED_ARTICLES = 8
-    MAX_SELECTED_HARD_LIMIT = 10
+    MAX_SELECTED_ARTICLES = 12
+    MAX_SELECTED_HARD_LIMIT = 15
     MAX_TRACE_DROPPED = 12
     HIGH_SCORE_THRESHOLD = 0.65
     INTERNAL_WHY_RELEVANT_MARKERS = (
@@ -46,13 +49,20 @@ class LawReranker:
         "Статья сохранена для проверки claim/fact coverage правовой конструкции.",
     )
 
-    def __init__(self, llm_client: LiteLLMClient, prompt_loader: PromptLoader) -> None:
+    def __init__(
+        self,
+        llm_client: LiteLLMClient,
+        prompt_loader: PromptLoader,
+        reranker_client: RerankerClient | None = None,
+    ) -> None:
         self.litellm_client = llm_client
         self.prompt_loader = prompt_loader
         self.settings = get_settings()
         self.role_registry = ArticleRoleRegistry()
-        self.semantic_analyzer = ArticleSemanticAnalyzer()
-        self.entailment_checker = ClaimEntailmentChecker()
+        self.semantic_analyzer = ArticleSemanticAnalyzer(llm_client, prompt_loader)
+        self.claim_matcher = ClaimMatcherLLM(llm_client, prompt_loader)
+        self.entailment_checker = ClaimEntailmentChecker(self.claim_matcher)
+        self.reranker_client = reranker_client or RerankerClient()
         self.last_trace: dict[str, Any] = {}
 
     def rerank(
@@ -61,27 +71,60 @@ class LawReranker:
         facts: dict[str, Any],
         legal_area: dict[str, Any],
         candidate_articles: list[dict[str, Any]],
+        request_id: str | None = None,
+        run_id: str | None = None,
     ) -> list[dict[str, Any]]:
         if not candidate_articles:
             return []
 
         facts_for_reranker = self._normalize_facts(facts)
         normalized_claims = self._normalized_claims(facts_for_reranker, user_text)
-        semantic_candidates = self._attach_semantics(candidate_articles)
-        llm_candidates = self._semantic_prefilter(semantic_candidates, normalized_claims)
-        prompt_template = self.prompt_loader.load("law_reranker.md")
-        prompt = (
-            prompt_template.replace("{{USER_TEXT}}", self._to_prompt_json(user_text))
-            .replace("{{FACTS}}", self._to_prompt_json(facts_for_reranker))
-            .replace("{{LEGAL_AREA}}", self._to_prompt_json(legal_area))
-            .replace("{{CANDIDATE_ARTICLES}}", self._to_prompt_json(self._compact_llm_candidates(llm_candidates)))
-        )
+        rerank_input_max = max(1, int(self.settings.legal_rag_rerank_input_max))
+        llm_top_k = max(1, int(self.settings.legal_rag_llm_article_top_k or self.settings.legal_rag_rerank_top_k))
+        rerank_candidates = [dict(article) for article in candidate_articles[:rerank_input_max]]
+        for article in rerank_candidates:
+            article["hybrid_score"] = float(
+                article.get("combined_score") or article.get("keyword_score") or article.get("vector_score") or 0.0
+            )
 
+        rerank_query = self._build_rerank_query(user_text, facts_for_reranker, legal_area, normalized_claims)
+        self._log_reranker_input(
+            candidate_articles,
+            rerank_candidates,
+            rerank_input_max=rerank_input_max,
+            request_id=request_id,
+            run_id=run_id,
+        )
+        rerank_fallback = False
         try:
-            raw = self.litellm_client.complete_json(prompt, self.settings.litellm_main_model)
-            ranked_items = self._merge_llm_ranked_items(semantic_candidates, raw)
+            ranked_candidates = self._apply_reranker(
+                rerank_query,
+                rerank_candidates,
+                request_id=request_id,
+                run_id=run_id,
+            )
         except LLMError:
-            ranked_items = self._fallback_ranked_items(semantic_candidates, facts_for_reranker)
+            rerank_fallback = True
+            ranked_candidates = self._fallback_ranked_items(rerank_candidates, facts_for_reranker)
+
+        reranked_for_llm = self._select_llm_candidates(
+            ranked_candidates,
+            facts_for_reranker,
+            legal_area,
+            normalized_claims,
+            llm_top_k,
+            rerank_fallback=rerank_fallback,
+            request_id=request_id,
+            run_id=run_id,
+        )
+        self._log_reranker_output(
+            ranked_candidates,
+            reranked_for_llm,
+            rerank_fallback=rerank_fallback,
+            request_id=request_id,
+            run_id=run_id,
+        )
+        semantic_candidates = self._attach_semantics(reranked_for_llm, request_id=request_id, run_id=run_id)
 
         role_corrections: list[dict[str, Any]] = []
         enriched = self._enrich_ranked_items(
@@ -89,26 +132,453 @@ class LawReranker:
             facts_for_reranker,
             normalized_claims,
             semantic_candidates,
-            ranked_items,
+            semantic_candidates,
             role_corrections,
         )
-        selected, coverage = self._select_by_entailment(user_text, facts_for_reranker, normalized_claims, enriched)
+        selected, coverage = self._select_by_entailment(
+            user_text,
+            facts_for_reranker,
+            normalized_claims,
+            enriched,
+            request_id=request_id,
+            run_id=run_id,
+        )
         self.last_trace = self._build_trace(
-            semantic_candidates,
+            rerank_candidates,
             facts_for_reranker,
             normalized_claims,
             enriched,
             selected,
             coverage,
             role_corrections,
+            ranked_candidates=ranked_candidates,
+            llm_candidates=semantic_candidates,
+            rerank_query=rerank_query,
+            rerank_fallback=rerank_fallback,
         )
         return selected
 
-    def _attach_semantics(self, candidate_articles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _log_reranker_input(
+        self,
+        candidate_articles: list[dict[str, Any]],
+        rerank_candidates: list[dict[str, Any]],
+        *,
+        rerank_input_max: int,
+        request_id: str | None = None,
+        run_id: str | None = None,
+    ) -> None:
+        log_json(
+            "legal_rag.reranker.input",
+            request_id=request_id,
+            run_id=run_id,
+            step="law_reranking",
+            rerank_input_max=rerank_input_max,
+            total_candidates_found=len(candidate_articles),
+            sent_to_reranker=len(rerank_candidates),
+            candidates=[self._summarize_candidate(article) for article in rerank_candidates[:12]],
+        )
+
+    def _apply_reranker(
+        self,
+        query: str,
+        candidates: list[dict[str, Any]],
+        *,
+        request_id: str | None = None,
+        run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        results = self.reranker_client.rerank(
+            query,
+            candidates,
+            top_n=len(candidates),
+            request_id=request_id,
+            run_id=run_id,
+        )
+        ranked_by_index = {int(item["index"]): float(item["relevance_score"]) for item in results}
+        ranked_candidates: list[dict[str, Any]] = []
+        for index, candidate in enumerate(candidates):
+            item = dict(candidate)
+            rerank_score = ranked_by_index.get(index)
+            if rerank_score is None:
+                rerank_score = float(item.get("hybrid_score") or 0.0)
+                item["rerank_reason"] = "missing_rerank_score_fallback_to_hybrid"
+            else:
+                item["rerank_reason"] = "qwen_reranker"
+            item["relevance_score"] = rerank_score
+            item["rerank_score"] = rerank_score
+            ranked_candidates.append(item)
+        return sorted(ranked_candidates, key=self._rerank_sort_key, reverse=True)
+
+    def _select_llm_candidates(
+        self,
+        ranked_candidates: list[dict[str, Any]],
+        facts: dict[str, Any],
+        legal_area: dict[str, Any],
+        normalized_claims: list[str],
+        llm_top_k: int,
+        *,
+        rerank_fallback: bool,
+        request_id: str | None = None,
+        run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        scenario = self._consumer_service_scenario(facts, legal_area, normalized_claims)
+        limit = (
+            max(1, int(self.settings.legal_rag_llm_article_top_k_on_rerank_fail))
+            if rerank_fallback
+            else llm_top_k
+        )
+        decorated: list[dict[str, Any]] = []
+        for candidate in ranked_candidates:
+            item = dict(candidate)
+            filter_result = self._pre_llm_filter(item, facts, legal_area, normalized_claims, scenario)
+            candidate.update(filter_result)
+            item.update(filter_result)
+            boost, reasons, boost_strength = self._llm_selection_boosts(item, facts, legal_area, normalized_claims, scenario)
+            item["selection_boost"] = boost
+            item["selection_boost_reasons"] = reasons
+            item["boost_strength"] = boost_strength
+            if reasons:
+                item["boost_reason"] = ", ".join(reasons)
+            log_json(
+                f"legal_rag.pre_llm_filter.{ 'kept' if item.get('pre_llm_keep') else 'excluded' }",
+                request_id=request_id,
+                run_id=run_id,
+                article_number=item.get("article_number"),
+                title=item.get("article_title") or item.get("title"),
+                act_name=item.get("act_name"),
+                reason=item.get("pre_llm_reason"),
+                case_type=facts.get("preliminary_case_type"),
+                detected_claims=normalized_claims,
+                matched_negative_domain=item.get("matched_negative_domain"),
+                matched_negative_keywords=item.get("matched_negative_keywords"),
+                negative_overridden_by_positive=item.get("negative_overridden_by_positive"),
+                negative_domain_decision_reason=item.get("negative_domain_decision_reason"),
+                missing_positive_signals=item.get("missing_positive_signals"),
+                matched_positive_signals=item.get("matched_positive_signals"),
+                legal_role=item.get("legal_role"),
+                hybrid_score=item.get("hybrid_score"),
+                rerank_score=item.get("rerank_score"),
+            )
+            decorated.append(item)
+        kept = [item for item in decorated if item.get("pre_llm_keep")]
+        if len(kept) < min(2, limit):
+            kept = self._rescue_targeted_candidates(decorated, kept, limit)
+        selected = sorted(kept, key=self._llm_selection_sort_key, reverse=True)[:limit]
+        for item in selected:
+            item["selection_reason"] = item.get("boost_reason") or "highest_rerank_score"
+        if rerank_fallback:
+            for item in selected:
+                item["selection_reason"] = f"fallback_mode:{item.get('selection_reason')}"
+        return selected
+
+    def _log_reranker_output(
+        self,
+        ranked_candidates: list[dict[str, Any]],
+        llm_candidates: list[dict[str, Any]],
+        *,
+        rerank_fallback: bool,
+        request_id: str | None = None,
+        run_id: str | None = None,
+    ) -> None:
+        log_json(
+            "legal_rag.reranker.output_top",
+            request_id=request_id,
+            run_id=run_id,
+            step="law_reranking",
+            rerank_fallback=rerank_fallback,
+            top_candidates=[self._summarize_candidate(article) for article in ranked_candidates[:12]],
+        )
+        log_json(
+            "legal_rag.llm_articles.selected",
+            request_id=request_id,
+            run_id=run_id,
+            step="law_reranking",
+            selected_for_llm=len(llm_candidates),
+            articles=[self._summarize_candidate(article) for article in llm_candidates],
+        )
+
+    def _build_rerank_query(
+        self,
+        user_text: str,
+        facts: dict[str, Any],
+        legal_area: dict[str, Any],
+        normalized_claims: list[str],
+    ) -> str:
+        query_parts = [
+            str(facts.get("summary") or ""),
+            str(legal_area.get("primary_area") or ""),
+            " ".join(normalized_claims),
+            str((facts.get("transaction") or {}).get("type") if isinstance(facts.get("transaction"), dict) else ""),
+            str((facts.get("problem") or {}).get("type") if isinstance(facts.get("problem"), dict) else ""),
+            str((facts.get("demand") or {}).get("type") if isinstance(facts.get("demand"), dict) else ""),
+            str(user_text or ""),
+        ]
+        return " ".join(part for part in query_parts if part).strip()
+
+    @staticmethod
+    def _rerank_sort_key(item: dict[str, Any]) -> tuple[float, float]:
+        return (
+            float(item.get("rerank_score") or item.get("relevance_score") or 0.0),
+            float(item.get("hybrid_score") or item.get("combined_score") or 0.0),
+        )
+
+    def _llm_selection_sort_key(self, item: dict[str, Any]) -> tuple[float, float, float]:
+        return (
+            float(item.get("selection_boost") or 0.0),
+            float(item.get("rerank_score") or item.get("relevance_score") or 0.0),
+            float(item.get("hybrid_score") or item.get("combined_score") or 0.0),
+        )
+
+    @staticmethod
+    def _consumer_service_scenario(
+        facts: dict[str, Any],
+        legal_area: dict[str, Any],
+        normalized_claims: list[str],
+    ) -> bool:
+        transaction = facts.get("transaction") if isinstance(facts.get("transaction"), dict) else {}
+        legal_area_secondary = {
+            str(item).lower() for item in (legal_area.get("secondary_areas") if isinstance(legal_area.get("secondary_areas"), list) else [])
+        }
+        transaction_type = str(transaction.get("type") or transaction.get("item_or_service") or "").lower()
+        return (
+            str(facts.get("preliminary_case_type") or "").lower() == "contract_nonperformance"
+            or str(legal_area.get("case_type") or "").lower() == "contract_nonperformance"
+            or (
+                "refund_principal" in normalized_claims
+                and "consumer" in legal_area_secondary
+                and any(token in transaction_type for token in ("услуг", "оказан"))
+            )
+        )
+
+    def _llm_selection_boosts(
+        self,
+        article: dict[str, Any],
+        facts: dict[str, Any],
+        legal_area: dict[str, Any],
+        normalized_claims: list[str],
+        consumer_service_scenario: bool,
+    ) -> tuple[float, list[str], float]:
+        score = float(article.get("rerank_score") or article.get("relevance_score") or 0.0)
+        boost = score
+        reasons: list[str] = []
+        boost_strength = 0.0
+        act_name = str(article.get("act_name") or "").lower()
+        text = " ".join(
+            [
+                str(article.get("article_title") or ""),
+                str(article.get("title") or ""),
+                str(article.get("snippet") or ""),
+                str(article.get("article_text") or ""),
+            ]
+        ).lower()
+        if article.get("matched_negative_domain"):
+            return boost, reasons, boost_strength
+        if consumer_service_scenario and "refund_principal" in normalized_claims:
+            service_terms = ("услуг", "оказан", "заказчик", "исполнитель", "срок оказания")
+            consumer_terms = ("потребител", "защите прав потребителей", "зозпп")
+            refund_terms = ("возврат", "вернуть", "уплачен", "отказ от договора")
+            if any(token in text for token in service_terms):
+                boost += 0.25
+                reasons.append("consumer_service_guard")
+                boost_strength += 0.25
+            if any(token in text for token in consumer_terms) or "защите прав потребителей" in act_name:
+                boost += 0.3
+                reasons.append("consumer_act_boost")
+                boost_strength += 0.3
+            if any(token in text for token in refund_terms):
+                boost += 0.12
+                reasons.append("refund_norm_boost")
+                boost_strength += 0.12
+        if "damages" in normalized_claims and any(token in text for token in ("убыт", "возмещ")):
+            boost += 0.08
+            reasons.append("damages_norm_boost")
+            boost_strength += 0.08
+        if str(article.get("article_number") or "") == "167" and not self._has_invalid_transaction_context(facts, legal_area):
+            boost -= 0.5
+            reasons.append("article_167_guard_penalty")
+        return boost, reasons, boost_strength
+
+    def _pre_llm_filter(
+        self,
+        article: dict[str, Any],
+        facts: dict[str, Any],
+        legal_area: dict[str, Any],
+        normalized_claims: list[str],
+        consumer_service_scenario: bool,
+    ) -> dict[str, Any]:
+        text = " ".join(
+            [
+                str(article.get("act_name") or ""),
+                str(article.get("article_title") or article.get("title") or ""),
+                str(article.get("snippet") or article.get("article_text") or ""),
+            ]
+        ).lower()
+        expected_acts = {str(item).lower() for item in (legal_area.get("expected_acts") or []) if isinstance(item, str)}
+        act_name = str(article.get("act_name") or "").lower()
+        expected_domain_hit = not expected_acts or any(item in act_name for item in expected_acts)
+        score = float(article.get("rerank_score") or article.get("relevance_score") or article.get("hybrid_score") or 0.0)
+        positive_signals = [token for token in self._positive_signals() if token in text]
+        strong_positive_signals = [token for token in self._strong_positive_signals() if token in text]
+        matched_negative_domain, matched_negative_keywords = self._match_negative_domain(text, normalized_claims)
+        strong_support = consumer_service_scenario and any(token in text for token in ("услуг", "потребител", "возврат", "договор"))
+        negative_overridden_by_positive = bool(matched_negative_domain and strong_positive_signals)
+
+        keep = False
+        reason = "off_topic_or_missing_positive_signals"
+        negative_domain_decision_reason = "insufficient_positive_signals"
+
+        if matched_negative_domain and not negative_overridden_by_positive:
+            reason = "off_topic_negative_domain"
+            negative_domain_decision_reason = "negative_domain_strong_no_positive"
+        elif expected_domain_hit and (strong_positive_signals or (positive_signals and score >= self.HIGH_SCORE_THRESHOLD)):
+            keep = True
+            reason = "direct_or_supporting_domain_match"
+            negative_domain_decision_reason = (
+                "positive_contract_signals_override_negative"
+                if matched_negative_domain
+                else "expected_domain_direct_match"
+            )
+        elif strong_support and strong_positive_signals:
+            keep = True
+            reason = "positive_contract_signals"
+            negative_domain_decision_reason = (
+                "positive_contract_signals_override_negative"
+                if matched_negative_domain
+                else "consumer_service_positive_signals"
+            )
+        elif score >= self.HIGH_SCORE_THRESHOLD and strong_positive_signals:
+            keep = True
+            reason = "score_supported_by_positive_signals"
+            negative_domain_decision_reason = (
+                "positive_contract_signals_override_negative"
+                if matched_negative_domain
+                else "high_score_with_positive_signals"
+            )
+        elif matched_negative_domain is None and expected_domain_hit and score >= self.HIGH_SCORE_THRESHOLD:
+            keep = True
+            reason = "expected_domain_score_match"
+            negative_domain_decision_reason = "expected_domain_direct_match"
+        elif matched_negative_domain is None and expected_domain_hit and not positive_signals and not str(facts.get("summary") or "").strip():
+            keep = True
+            reason = "no_context_expected_domain_fallback"
+            negative_domain_decision_reason = "expected_domain_direct_match"
+
+        return {
+            "pre_llm_keep": keep,
+            "pre_llm_reason": reason,
+            "matched_positive_signals": positive_signals,
+            "missing_positive_signals": [] if positive_signals else ["contract_or_service_or_refund_or_damages"],
+            "matched_negative_domain": matched_negative_domain,
+            "matched_negative_keywords": matched_negative_keywords,
+            "negative_overridden_by_positive": negative_overridden_by_positive,
+            "negative_domain_decision_reason": negative_domain_decision_reason,
+        }
+
+    @staticmethod
+    def _positive_signals() -> tuple[str, ...]:
+        return (
+            "договор",
+            "обязатель",
+            "неисполн",
+            "ненадлежащ",
+            "просроч",
+            "услуг",
+            "работ",
+            "заказчик",
+            "исполнитель",
+            "потребител",
+            "возврат",
+            "расторжен",
+            "убыт",
+            "ответственност",
+            "защите прав потребителей",
+            "кредитор",
+            "должник",
+            "оплат",
+        )
+
+    @staticmethod
+    def _strong_positive_signals() -> tuple[str, ...]:
+        return (
+            "договор",
+            "неисполн",
+            "ненадлежащ",
+            "просроч",
+            "услуг",
+            "работ",
+            "заказчик",
+            "исполнитель",
+            "возврат",
+            "убыт",
+            "ответственност",
+            "оплат",
+        )
+
+    @staticmethod
+    def _match_negative_domain(text: str, normalized_claims: list[str]) -> tuple[str | None, list[str]]:
+        negative_domains = {
+            "security": (
+                "залог",
+                "ипотек",
+                "поручитель",
+                "поручительств",
+                "банковская гарантия",
+                "независимая гарантия",
+                "залогодержат",
+                "залогодатель",
+            ),
+            "property": ("вещн", "собственност", "земельн"),
+            "corporate": ("акционер", "участник общества", "корпоратив"),
+            "family": ("брак", "алименты", "супруг"),
+            "inheritance": ("наслед", "завещан"),
+            "labor": ("работодатель", "увольнен", "трудов"),
+            "administrative": ("административ", "госуслуг", "разрешени"),
+            "precontract": ("переговор", "преддоговор"),
+            "tort": ("деликт",) if "damages" in normalized_claims else ("вред", "деликт"),
+        }
+        for domain, tokens in negative_domains.items():
+            matched = [token for token in tokens if token and token in text]
+            if matched:
+                return domain, matched
+        return None, []
+
+    @staticmethod
+    def _rescue_targeted_candidates(
+        decorated: list[dict[str, Any]],
+        kept: list[dict[str, Any]],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        rescued = list(kept)
+        for item in decorated:
+            if item in rescued:
+                continue
+            positives = item.get("matched_positive_signals") if isinstance(item.get("matched_positive_signals"), list) else []
+            if item.get("matched_negative_domain") is None and len(positives) >= 2:
+                rescued.append(item)
+            if len(rescued) >= limit:
+                break
+        return rescued
+
+    @staticmethod
+    def _has_invalid_transaction_context(facts: dict[str, Any], legal_area: dict[str, Any]) -> bool:
+        text = " ".join(
+            [
+                str(facts.get("summary") or ""),
+                str(legal_area.get("reason") or ""),
+                str((facts.get("problem") or {}).get("description") if isinstance(facts.get("problem"), dict) else ""),
+            ]
+        ).lower()
+        return any(token in text for token in ("недействитель", "ничтожн", "оспарив", "сделк"))
+
+    def _attach_semantics(
+        self,
+        candidate_articles: list[dict[str, Any]],
+        request_id: str | None = None,
+        run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         for article in candidate_articles:
             item = dict(article)
-            semantic = self.semantic_analyzer.analyze(item)
+            semantic = self.semantic_analyzer.analyze(item, request_id=request_id, run_id=run_id)
             item["semantic_analysis"] = semantic
             item["semantic_summary"] = semantic.get("semantic_summary")
             item["legal_effects"] = semantic.get("legal_effects", [])
@@ -194,14 +664,16 @@ class LawReranker:
     def _fallback_ranked_items(self, candidate_articles: list[dict[str, Any]], facts: dict[str, Any]) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         for candidate in candidate_articles:
-            score = float(candidate.get("combined_score") or candidate.get("keyword_score") or candidate.get("vector_score") or 0.0)
+            score = float(candidate.get("hybrid_score") or candidate.get("combined_score") or candidate.get("keyword_score") or candidate.get("vector_score") or 0.0)
             applicability = self._fallback_applicability(score)
             merged = dict(candidate)
             merged.update(
                 {
                     "relevance_score": score,
+                    "rerank_score": score,
                     "applicability": applicability,
                     "why_relevant": "Fallback reranker used because the LLM reranker was unavailable.",
+                    "rerank_reason": "hybrid_score_fallback",
                     "regulates": candidate.get("article_title") or candidate.get("chapter_title"),
                     "missing_facts": self._infer_missing_facts(candidate, facts),
                     "legal_role": None,
@@ -398,8 +870,17 @@ class LawReranker:
         facts: dict[str, Any],
         normalized_claims: list[str],
         ranked_items: list[dict[str, Any]],
+        request_id: str | None = None,
+        run_id: str | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        coverage = self.entailment_checker.build_coverage(normalized_claims, ranked_items, facts, user_text)
+        coverage = self.entailment_checker.build_coverage(
+            normalized_claims,
+            ranked_items,
+            facts,
+            user_text,
+            request_id=request_id,
+            run_id=run_id,
+        )
         selected: list[dict[str, Any]] = []
         selected_ids: set[str] = set()
         dropped_relevant: list[dict[str, Any]] = []
@@ -533,16 +1014,23 @@ class LawReranker:
             "return_received": "refund_or_restitution",
             "damages_recovery": "damages_recovery",
             "damages_definition": "damages_definition",
+            "liability_basis": "liability_basis",
+            "interest": "monetary_obligation_interest",
             "interest_recovery": "monetary_obligation_interest",
             "delay_liability": "breach_or_delay",
             "termination_or_refusal": "termination_or_refusal",
+            "termination_consequence": "refund_or_restitution",
             "termination_consequences": "refund_or_restitution",
+            "obligation_performance": "obligation_basis",
             "performance_terms": "performance_terms",
             "obligation_basis": "obligation_basis",
+            "security_or_deposit": "penalty_or_security",
+            "penalty": "penalty_or_security",
             "penalty_or_security": "penalty_or_security",
             "limitation_or_exception": "exception_or_limitation",
             "creditor_delay": "exception_or_limitation",
             "impossibility": "exception_or_limitation",
+            "procedural": "procedure",
         }.get(effect_type)
 
     @classmethod
@@ -676,7 +1164,18 @@ class LawReranker:
             claims.append("performance")
         if demand_type == "cancel_contract" or any(token in text for token in ("расторг", "отказ от договора", "отказаться от договора")):
             claims.append("termination/refusal")
-        if any(token in text for token in ("неустой", "штраф", "пен", "задат", "обеспеч")):
+        has_penalty_terms = any(token in text for token in ("неустой", "штраф", "пен", "задат", "обеспеч"))
+        has_penalty_negation = any(
+            token in text
+            for token in (
+                "без неустой",
+                "без штраф",
+                "без пен",
+                "без задат",
+                "без обеспеч",
+            )
+        )
+        if has_penalty_terms and not has_penalty_negation:
             claims.append("penalty")
         if any(token in text for token in ("реституц", "неосновательн", "возврат уплаченного")):
             claims.append("restitution")
@@ -1043,16 +1542,22 @@ class LawReranker:
         selected_items: list[dict[str, Any]],
         coverage: dict[str, Any],
         role_corrections: list[dict[str, Any]],
+        *,
+        ranked_candidates: list[dict[str, Any]],
+        llm_candidates: list[dict[str, Any]],
+        rerank_query: str,
+        rerank_fallback: bool,
     ) -> dict[str, Any]:
         before_by_id = {str(item.get("id")): item for item in candidates_before}
         selected_by_id = {str(item.get("id")): item for item in selected_items}
+        ranked_by_id = {str(item.get("id")): item for item in ranked_candidates}
         promoted: list[dict[str, Any]] = []
         demoted: list[dict[str, Any]] = []
         dropped: list[dict[str, Any]] = []
 
         for article_id, before in before_by_id.items():
             after = selected_by_id.get(article_id)
-            ranked = next((item for item in ranked_items if str(item.get("id")) == article_id), None)
+            ranked = ranked_by_id.get(article_id)
             if not after:
                 if ranked:
                     dropped.append(cls._summarize_candidate(ranked))
@@ -1067,7 +1572,11 @@ class LawReranker:
         return {
             "facts_for_reranker": facts,
             "normalized_claims": normalized_claims,
+            "rerank_query": rerank_query,
+            "rerank_fallback": rerank_fallback,
             "candidates_before": [cls._summarize_candidate(item) for item in candidates_before],
+            "reranker_output": [cls._summarize_candidate(item) for item in ranked_candidates],
+            "llm_articles_selected": [cls._summarize_candidate(item) for item in llm_candidates],
             "candidates_after": [cls._summarize_candidate(item) for item in selected_items],
             "promoted_articles": promoted,
             "demoted_articles": demoted,
@@ -1086,14 +1595,26 @@ class LawReranker:
         return {
             "id": str(candidate.get("id") or ""),
             "act_name": candidate.get("act_name"),
+            "act_code": candidate.get("act_code"),
             "article_number": candidate.get("article_number"),
             "title": candidate.get("article_title"),
             "score": float(candidate.get("relevance_score") or candidate.get("combined_score") or candidate.get("keyword_score") or candidate.get("vector_score") or 0.0),
+            "hybrid_score": float(candidate.get("hybrid_score") or candidate.get("combined_score") or candidate.get("keyword_score") or candidate.get("vector_score") or 0.0),
+            "rerank_score": float(candidate.get("rerank_score") or candidate.get("relevance_score") or 0.0),
             "applicability": candidate.get("applicability"),
             "why_relevant": candidate.get("why_relevant"),
             "legal_role": candidate.get("legal_role"),
             "covers_claims": candidate.get("covers_claims"),
             "coverage_type": candidate.get("coverage_type"),
+            "boost_reason": candidate.get("boost_reason"),
+            "selection_reason": candidate.get("selection_reason"),
+            "rerank_reason": candidate.get("rerank_reason"),
+            "pre_llm_reason": candidate.get("pre_llm_reason"),
+            "matched_negative_domain": candidate.get("matched_negative_domain"),
+            "matched_negative_keywords": candidate.get("matched_negative_keywords"),
+            "matched_positive_signals": candidate.get("matched_positive_signals"),
+            "negative_overridden_by_positive": candidate.get("negative_overridden_by_positive"),
+            "negative_domain_decision_reason": candidate.get("negative_domain_decision_reason"),
         }
 
     def _user_visible_why_relevant(self, item: dict[str, Any], rule: ArticleRoleRule | None) -> str:
